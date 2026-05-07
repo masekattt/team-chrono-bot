@@ -18,44 +18,34 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ Переменная BOT_TOKEN не установлена!")
 
-# ID вашей Google таблицы (замените на свой!)
-SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"  # ← ВСТАВЬТЕ СВОЙ ID!
+# ЗАМЕНИТЕ НА ВАШ ID ТАБЛИЦЫ
+SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"
 
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
 REMINDER_MINUTE = 0
 
-# Галерея картинок (замените ссылки)
 GALLERY = [
-    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
-    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
-    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
+    "https://example.com/image1.jpg",
+    "https://example.com/image2.jpg",
 ]
 
-# ========== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS (исправлено для Render) ==========
+# ========== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ==========
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# Пробуем получить credentials из переменной окружения
 credentials_json = os.environ.get("CREDENTIALS_JSON")
-
 if credentials_json:
-    # На Render — берём из переменной
     creds_dict = json.loads(credentials_json)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    print("✅ Credentials загружены из переменной CREDENTIALS_JSON")
+    print("✅ Credentials загружены из переменной")
 else:
-    # Локально — пробуем файл
-    if os.path.exists("credentials.json"):
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-        print("✅ Credentials загружены из файла credentials.json")
-    else:
-        raise ValueError("❌ Нет credentials! Установите переменную CREDENTIALS_JSON или положите файл credentials.json")
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    print("✅ Credentials загружены из файла")
 
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
 users_ws = sheet.worksheet("Users")
 chrono_ws = sheet.worksheet("Chrono")
-print("✅ Подключение к Google Sheets установлено")
 
 # ========== КНОПКИ ==========
 main_kb = ReplyKeyboardMarkup(
@@ -106,7 +96,8 @@ def update_record(row_idx: int, new_text: str):
 def get_record_by_date(full_name: str, target_date: str):
     records = chrono_ws.get_all_records()
     for idx, row in enumerate(records, start=2):
-        if row["ФИО"] == full_name and str(row["Дата и время создания"]).startswith(target_date):
+        created_date = str(row["Дата и время создания"]).split(" ")[0]
+        if row["ФИО"] == full_name and created_date == target_date:
             return idx, row["Текст"]
     return None
 
@@ -128,7 +119,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def process_name(message: types.Message, state: FSMContext):
     full_name = message.text.strip()
     if not full_name:
-        await message.answer("Имя не может быть пустым. Напиши, пожалуйста.")
+        await message.answer("Имя не может быть пустым.")
         return
     save_user(message.from_user.id, full_name)
     await message.answer(f"Отлично, {full_name}! Теперь ты можешь вносить часы.", reply_markup=main_kb)
@@ -143,18 +134,18 @@ async def add_chrono(message: types.Message, state: FSMContext):
     if get_today_record(full_name):
         await message.answer("❌ Ты уже вводил задачи сегодня. Используй кнопку «Изменить часы».")
         return
-    await message.answer("📝 Отправь список задач на сегодня (каждую с новой строки):\nПример:\n1. Общался с ИИ — 2ч\n2. Резал морковь — 24ч")
+    await message.answer("📝 Отправь список задач на сегодня (каждую с новой строки):")
     await state.set_state(ChronoState.waiting_for_text)
     await state.update_data(full_name=full_name)
 
 @dp.message(ChronoState.waiting_for_text)
 async def save_chrono(message: types.Message, state: FSMContext):
     if len(message.text.strip()) < 5:
-        await message.answer("Слишком коротко. Напиши хотя бы одно дело с часами.")
+        await message.answer("Слишком коротко. Напиши хотя бы одно дело.")
         return
     data = await state.get_data()
     create_record(data["full_name"], message.text)
-    await message.answer("✅ Запись сохранена!")
+    await message.answer("✅ Запись сохранена!", reply_markup=main_kb)
     await state.clear()
 
 @dp.message(lambda msg: msg.text == "✏️ Изменить часы")
@@ -175,15 +166,18 @@ async def process_edit_date(message: types.Message, state: FSMContext):
     except:
         await message.answer("❌ Неверный формат. Используй ГГГГ-ММ-ДД")
         return
+    
     data = await state.get_data()
     full_name = data["full_name"]
     record = get_record_by_date(full_name, date_str)
+    
     if not record:
-        await message.answer(f"❌ Нет записей за {date_str}.")
+        await message.answer(f"❌ Нет записей за {date_str}.", reply_markup=main_kb)
         await state.clear()
         return
+    
     row_idx, old_text = record
-    await message.answer(f"📋 Текущий текст за {date_str}:\n\n{old_text}\n\n✏️ Отправь новый текст (многострочный):")
+    await message.answer(f"📋 Текущий текст за {date_str}:\n\n{old_text}\n\n✏️ Отправь НОВЫЙ текст (многострочный):")
     await state.set_state(ChronoState.waiting_for_new_text)
     await state.update_data(row_idx=row_idx)
 
@@ -194,11 +188,34 @@ async def save_edited_chrono(message: types.Message, state: FSMContext):
         return
     data = await state.get_data()
     update_record(data["row_idx"], message.text)
-    await message.answer("✅ Запись обновлена!")
+    await message.answer("✅ Запись обновлена!", reply_markup=main_kb)
     await state.clear()
+
+# ========== НАПОМИНАНИЯ В 19:00 ==========
+async def send_reminders():
+    while True:
+        now = datetime.now(TIMEZONE)
+        target = now.replace(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        
+        users = users_ws.get_all_records()
+        for user in users:
+            tg_id = int(user["telegram_id"])
+            full_name = user["full_name"]
+            if get_today_record(full_name) is None:
+                try:
+                    img = random.choice(GALLERY)
+                    await bot.send_photo(tg_id, img, caption=f"🔔 Напоминание: внеси часы за сегодня, {full_name}!")
+                    await bot.send_message(tg_id, "Используй кнопки ниже:", reply_markup=main_kb)
+                except Exception as e:
+                    print(f"Ошибка напоминания {full_name}: {e}")
 
 # ========== ЗАПУСК ==========
 async def main():
+    asyncio.create_task(send_reminders())
     print("✅ Бот запущен!")
     await dp.start_polling(bot)
 
