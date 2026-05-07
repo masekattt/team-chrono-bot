@@ -174,37 +174,53 @@ async def edit_chrono(message: types.Message, state: FSMContext):
     await state.update_data(full_name=full_name)
 
 @dp.message(ChronoState.waiting_for_edit_date)
-async def process_edit_date(message: types.Message, state: FSMContext):
-    date_str = message.text.strip()
+async def process_edit_date(msg: types.Message, state: FSMContext):
+    date_str = msg.text.strip()
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
     except:
-        await message.answer("❌ Неверный формат. Используй ГГГГ-ММ-ДД")
+        await msg.answer("❌ Неверный формат. Пример: 2026-05-07")
         return
-    
+
     data = await state.get_data()
-    full_name = data["full_name"]
-    record = get_record_by_date(full_name, date_str)
-    
+    name = data["full_name"]
+    record = get_record_by_date(name, date_str)
+
     if not record:
-        await message.answer(f"❌ Нет записей за {date_str}.", reply_markup=main_kb)
+        await msg.answer(f"Нет записей за {date_str}", reply_markup=main_kb)
         await state.clear()
         return
-    
+
     row_idx, old_text = record
-    await message.answer(f"📋 Текущий текст за {date_str}:\n\n{old_text}\n\n✏️ Отправь НОВЫЙ текст (многострочный):")
+    await msg.answer(f"📋 ТЕКУЩИЙ текст за {date_str}:\n\n{old_text}\n\n✏️ Отправь НОВЫЙ текст:")
     await state.set_state(ChronoState.waiting_for_new_text)
     await state.update_data(row_idx=row_idx)
+    print(f"🔍 DEBUG: row_idx={row_idx} сохранён в FSM")  # ← ЛОГ
 
 @dp.message(ChronoState.waiting_for_new_text)
-async def save_edited_chrono(message: types.Message, state: FSMContext):
-    if len(message.text.strip()) < 5:
-        await message.answer("Слишком коротко. Напиши нормальный список задач.")
-        return
+async def save_edited_chrono(msg: types.Message, state: FSMContext):
     data = await state.get_data()
-    update_record(data["row_idx"], message.text)
-    await message.answer("✅ Запись обновлена!", reply_markup=main_kb)
-    await state.clear()
+    row_idx = data.get("row_idx")
+    print(f"🔍 DEBUG: row_idx из FSM = {row_idx}")  # ← ЛОГ
+
+    if row_idx is None:
+        await msg.answer("❌ Ошибка: не найдена строка для редактирования. Попробуй ещё раз.", reply_markup=main_kb)
+        await state.clear()
+        return
+
+    if len(msg.text.strip()) < 5:
+        await msg.answer("Слишком коротко. Отправь нормальный список.")
+        return
+
+    try:
+        update_record(row_idx, msg.text.strip())
+        await msg.answer("✅ Запись обновлена!", reply_markup=main_kb)
+        print(f"🔍 DEBUG: Запись {row_idx} успешно обновлена")  # ← ЛОГ
+    except Exception as e:
+        await msg.answer(f"❌ Ошибка при обновлении: {e}")
+        print(f"🔍 DEBUG: Ошибка обновления — {e}")
+    finally:
+        await state.clear()
 
 # ========== НАПОМИНАНИЯ В 19:00 ==========
 async def send_reminders():
