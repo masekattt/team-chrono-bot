@@ -4,7 +4,7 @@ import asyncio
 import gspread
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -13,34 +13,29 @@ from oauth2client.service_account import ServiceAccountCredentials
 import pytz
 import json
 
-# ========== КОНФИГУРАЦИЯ ==========
+# ========== КОНФИГ ==========
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("❌ Переменная BOT_TOKEN не установлена!")
+    raise ValueError("BOT_TOKEN missing")
 
-# ЗАМЕНИТЕ НА ВАШ ID ТАБЛИЦЫ
-SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"
+SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"  # ЗАМЕНИТЕ НА ВАШ
 
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
 REMINDER_MINUTE = 0
 
 GALLERY = [
-    "https://example.com/image1.jpg",
-    "https://example.com/image2.jpg",
+    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
 ]
 
-# ========== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ==========
+# ========== GOOGLE SHEETS ==========
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-credentials_json = os.environ.get("CREDENTIALS_JSON")
-if credentials_json:
-    creds_dict = json.loads(credentials_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    print("✅ Credentials загружены из переменной")
+creds_json = os.environ.get("CREDENTIALS_JSON")
+if creds_json:
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
 else:
     creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
-    print("✅ Credentials загружены из файла")
 
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
@@ -56,22 +51,15 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# ========== FSM СОСТОЯНИЯ ==========
+# ========== FSM ==========
 class RegisterState(StatesGroup):
     waiting_for_name = State()
 
 class ChronoState(StatesGroup):
     waiting_for_text = State()
-    waiting_for_edit_date = State()
-    waiting_for_new_text = State()
+    waiting_for_edit_text = State()  # новое состояние для ожидания текста при редактировании
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (работа с индексами столбцов) ==========
-# Столбцы в листе Chrono:
-# A (1) = ФИО
-# B (2) = Текст
-# C (3) = Дата и время создания
-# D (4) = Дата и время изменения
-
+# ========== РАБОТА С ТАБЛИЦЕЙ ==========
 def get_user_name(tg_id):
     try:
         cell = users_ws.find(str(tg_id))
@@ -94,6 +82,17 @@ def create_record(name, text):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     chrono_ws.append_row([name, text, now, ""])
 
+def get_all_user_dates(name):
+    """Возвращает список всех дат, за которые у пользователя есть записи"""
+    records = chrono_ws.get_all_records()
+    dates = []
+    for row in records:
+        if row["ФИО"] == name:
+            date_str = str(row["Дата и время создания"]).split()[0]
+            if date_str not in dates:
+                dates.append(date_str)
+    return sorted(dates, reverse=True)  # свежие сверху
+
 def get_record_by_date(name, target_date):
     records = chrono_ws.get_all_records()
     for idx, row in enumerate(records, start=2):
@@ -104,177 +103,147 @@ def get_record_by_date(name, target_date):
 
 def update_record(row_idx, new_text):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    # ВАЖНО: двойные квадратные скобки [[значение]]
     chrono_ws.update(f"B{row_idx}", [[new_text]])
     chrono_ws.update(f"D{row_idx}", [[now]])
-
-def get_record_by_date(full_name: str, target_date: str):
-    all_records = chrono_ws.get_all_values()
-    for idx, row in enumerate(all_records, start=1):
-        if idx == 1:
-            continue
-        if len(row) >= 3:
-            row_name = row[0]      # A: ФИО
-            row_date = row[2]      # C: дата создания, берём только первые 10 символов (YYYY-MM-DD)
-            if row_name == full_name and row_date.startswith(target_date):
-                return [idx, row[1]]  # возвращаем номер строки и текст из B
-    return None
 
 # ========== ХЕНДЛЕРЫ ==========
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    tg_id = message.from_user.id
+async def cmd_start(msg: types.Message, state: FSMContext):
+    tg_id = msg.from_user.id
     name = get_user_name(tg_id)
     if name:
-        await message.answer(f"С возвращением, {name}!", reply_markup=main_kb)
+        await msg.answer(f"С возвращением, {name}!", reply_markup=main_kb)
     else:
-        await message.answer("Привет! Как тебя зовут? (напиши ФИО)")
+        await msg.answer("Привет! Как тебя зовут? (напиши ФИО)")
         await state.set_state(RegisterState.waiting_for_name)
 
 @dp.message(RegisterState.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
-    full_name = message.text.strip()
-    if not full_name:
-        await message.answer("Имя не может быть пустым.")
+async def process_name(msg: types.Message, state: FSMContext):
+    name = msg.text.strip()
+    if not name:
+        await msg.answer("Имя не может быть пустым")
         return
-    save_user(message.from_user.id, full_name)
-    await message.answer(f"Отлично, {full_name}! Теперь ты можешь вносить часы.", reply_markup=main_kb)
+    save_user(msg.from_user.id, name)
+    await msg.answer(f"Принято, {name}!", reply_markup=main_kb)
     await state.clear()
 
-@dp.message(lambda msg: msg.text == "✍️ Ввести часы")
-async def add_chrono(message: types.Message, state: FSMContext):
-    full_name = get_user_name(message.from_user.id)
-    if not full_name:
-        await message.answer("Сначала зарегистрируйся: /start")
+@dp.message(lambda m: m.text == "✍️ Ввести часы")
+async def add_chrono(msg: types.Message, state: FSMContext):
+    name = get_user_name(msg.from_user.id)
+    if not name:
+        await msg.answer("Сначала /start")
         return
-    if get_today_record(full_name):
-        await message.answer("❌ Ты уже вводил задачи сегодня. Используй кнопку «Изменить часы».")
+    if get_today_record(name):
+        await msg.answer("❌ Сегодня уже введено. Используйте ✏️ Изменить часы")
         return
-    await message.answer("📝 Отправь список задач на сегодня (каждую с новой строки):\nПример:\n1. Общался с ИИ — 2ч\n2. Резал морковь — 24ч")
+    await msg.answer("📝 Отправь список задач на сегодня (многострочный):")
     await state.set_state(ChronoState.waiting_for_text)
-    await state.update_data(full_name=full_name)
+    await state.update_data(full_name=name)
 
 @dp.message(ChronoState.waiting_for_text)
-async def save_chrono(message: types.Message, state: FSMContext):
-    if len(message.text.strip()) < 5:
-        await message.answer("Слишком коротко. Напиши хотя бы одно дело.")
+async def save_chrono(msg: types.Message, state: FSMContext):
+    if len(msg.text.strip()) < 5:
+        await msg.answer("Слишком коротко. Напиши хотя бы одно дело.")
         return
     data = await state.get_data()
-    create_record(data["full_name"], message.text)
-    await message.answer("✅ Запись сохранена!", reply_markup=main_kb)
+    create_record(data["full_name"], msg.text)
+    await msg.answer("✅ Запись сохранена!", reply_markup=main_kb)
     await state.clear()
 
-@dp.message(lambda msg: msg.text == "✏️ Изменить часы")
-async def edit_chrono(message: types.Message, state: FSMContext):
-    full_name = get_user_name(message.from_user.id)
-    if not full_name:
-        await message.answer("Сначала зарегистрируйся: /start")
+@dp.message(lambda m: m.text == "✏️ Изменить часы")
+async def edit_chrono_choose_date(msg: types.Message, state: FSMContext):
+    name = get_user_name(msg.from_user.id)
+    if not name:
+        await msg.answer("Сначала /start")
         return
-    await message.answer("📅 Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-07):")
-    await state.set_state(ChronoState.waiting_for_edit_date)
-    await state.update_data(full_name=full_name)
-
-@dp.message(ChronoState.waiting_for_edit_date)
-async def process_edit_date(msg: types.Message, state: FSMContext):
-    date_str = msg.text.strip()
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except:
-        await msg.answer("❌ Неверный формат. Пример: 2026-05-07")
+    
+    dates = get_all_user_dates(name)
+    if not dates:
+        await msg.answer("❌ У тебя пока нет записей. Сначала введи часы через ✍️ Ввести часы")
         return
+    
+    # Создаём кнопки с датами (по 3 в ряд)
+    keyboard = []
+    row = []
+    for i, date in enumerate(dates):
+        row.append(InlineKeyboardButton(text=date, callback_data=f"edit_{date}"))
+        if (i + 1) % 3 == 0 or i == len(dates) - 1:
+            keyboard.append(row)
+            row = []
+    
+    keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="edit_cancel")])
+    
+    await msg.answer("📅 Выбери дату, за которую хочешь изменить часы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
-    data = await state.get_data()
-    name = data["full_name"]
+@dp.callback_query(lambda c: c.data and c.data.startswith("edit_"))
+async def process_edit_date(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if callback.data == "edit_cancel":
+        await callback.message.edit_text("❌ Отменено", reply_markup=None)
+        await callback.message.answer("Главное меню:", reply_markup=main_kb)
+        return
+    
+    date_str = callback.data.replace("edit_", "")
+    name = get_user_name(callback.from_user.id)
+    
     record = get_record_by_date(name, date_str)
-
     if not record:
-        await msg.answer(f"Нет записей за {date_str}", reply_markup=main_kb)
-        await state.clear()
+        await callback.message.edit_text(f"❌ Ошибка: нет записей за {date_str}")
         return
-
+    
     row_idx, old_text = record
-    await msg.answer(f"📋 ТЕКУЩИЙ текст за {date_str}:\n\n{old_text}\n\n✏️ Отправь НОВЫЙ текст:")
-    await state.set_state(ChronoState.waiting_for_new_text)
-    await state.update_data(row_idx=row_idx)
-    print(f"🔍 DEBUG: row_idx={row_idx} сохранён в FSM")  # ← ЛОГ
+    
+    await callback.message.edit_text(
+        f"📅 *{date_str}*\n\n"
+        f"📋 *Текущий текст:*\n{old_text}\n\n"
+        f"✏️ Отправь **НОВЫЙ** текст (многострочный):",
+        parse_mode="Markdown"
+    )
+    
+    await state.set_state(ChronoState.waiting_for_edit_text)
+    await state.update_data(row_idx=row_idx, date_str=date_str)
 
-@dp.message(ChronoState.waiting_for_new_text)
+@dp.message(ChronoState.waiting_for_edit_text)
 async def save_edited_chrono(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    row_idx = data.get("row_idx")
-    print(f"🔍 DEBUG: row_idx из FSM = {row_idx}")  # ← ЛОГ
-
-    if row_idx is None:
-        await msg.answer("❌ Ошибка: не найдена строка для редактирования. Попробуй ещё раз.", reply_markup=main_kb)
-        await state.clear()
-        return
-
     if len(msg.text.strip()) < 5:
-        await msg.answer("Слишком коротко. Отправь нормальный список.")
+        await msg.answer("❌ Слишком коротко. Отправь нормальный список задач (минимум 5 символов).")
         return
+    
+    data = await state.get_data()
+    update_record(data["row_idx"], msg.text)
+    
+    await msg.answer(f"✅ Запись за {data['date_str']} обновлена!", reply_markup=main_kb)
+    await state.clear()
 
-    try:
-        update_record(row_idx, msg.text.strip())
-        await msg.answer("✅ Запись обновлена!", reply_markup=main_kb)
-        print(f"🔍 DEBUG: Запись {row_idx} успешно обновлена")  # ← ЛОГ
-    except Exception as e:
-        await msg.answer(f"❌ Ошибка при обновлении: {e}")
-        print(f"🔍 DEBUG: Ошибка обновления — {e}")
-    finally:
-        await state.clear()
-
-# ========== НАПОМИНАНИЯ В 19:00 ==========
-async def send_reminders():
+# ========== НАПОМИНАНИЯ ==========
+async def reminder_loop():
     while True:
         now = datetime.now(TIMEZONE)
         target = now.replace(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
+        await asyncio.sleep((target - now).total_seconds())
         
         users = users_ws.get_all_records()
         for user in users:
             tg_id = int(user["telegram_id"])
-            full_name = user["full_name"]
-            if get_today_record(full_name) is None:
+            name = user["full_name"]
+            if not get_today_record(name):
                 try:
                     img = random.choice(GALLERY)
-                    await bot.send_photo(tg_id, img, caption=f"🔔 Напоминание: внеси часы за сегодня, {full_name}!")
-                    await bot.send_message(tg_id, "Используй кнопки ниже:", reply_markup=main_kb)
-                except Exception as e:
-                    print(f"Ошибка напоминания {full_name}: {e}")
-
-# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
-from aiohttp import web
-
-async def health_check(request):
-    """Эндпоинт для проверки работоспособности"""
-    return web.Response(text="Бот работает!")
-
-async def start_web_server():
-    """Запускает минимальный веб-сервер на порту 8080"""
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    print("✅ Веб-сервер запущен на порту 8080")
+                    await bot.send_photo(tg_id, img, caption=f"🔔 {name}, внеси часы за сегодня!")
+                    await bot.send_message(tg_id, "Кнопки внизу:", reply_markup=main_kb)
+                except:
+                    pass
 
 # ========== ЗАПУСК ==========
 async def main():
-    # Запускаем веб-сервер для Render
-    await start_web_server()
-    
-    # Запускаем напоминания
-    asyncio.create_task(send_reminders())
-    
-    print("✅ Бот запущен!")
+    asyncio.create_task(reminder_loop())
+    print("✅ Бот запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
