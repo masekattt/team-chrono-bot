@@ -228,9 +228,32 @@ async def send_reminders():
                 except Exception as e:
                     print(f"Ошибка напоминания {full_name}: {e}")
 
+# ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
+from aiohttp import web
+
+async def health_check(request):
+    """Эндпоинт для проверки работоспособности"""
+    return web.Response(text="Бот работает!")
+
+async def start_web_server():
+    """Запускает минимальный веб-сервер на порту 8080"""
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    print("✅ Веб-сервер запущен на порту 8080")
+
 # ========== ЗАПУСК ==========
 async def main():
+    # Запускаем веб-сервер для Render
+    await start_web_server()
+    
+    # Запускаем напоминания
     asyncio.create_task(send_reminders())
+    
     print("✅ Бот запущен!")
     await dp.start_polling(bot)
 
