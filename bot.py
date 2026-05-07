@@ -2,37 +2,60 @@ import os
 import random
 import asyncio
 import gspread
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from oauth2client.service_account import ServiceAccountCredentials
 import pytz
+import json
 
 # ========== КОНФИГУРАЦИЯ ==========
-TOKEN = "8640718496:AAGR9CZIzl1NFn4RPEoquqZAF65nQeOiBNw"
-SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"  # Из URL: https://docs.google.com/spreadsheets/d/ЭТОТ_ID/edit
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("❌ Переменная BOT_TOKEN не установлена!")
+
+# ID вашей Google таблицы (замените на свой!)
+SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"  # ← ВСТАВЬТЕ СВОЙ ID!
+
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
 REMINDER_MINUTE = 0
 
-# Галерея картинок (замените ссылки на свои)
+# Галерея картинок (замените ссылки)
 GALLERY = [
-    "https://example.com/image1.jpg",
-    "https://example.com/image2.jpg",
-    "https://example.com/image3.jpg",
+    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
+    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
+    "https://images.unsplash.com/photo-1506784983877-45594efa4cbe",
 ]
 
-# ========== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS ==========
+# ========== ПОДКЛЮЧЕНИЕ К GOOGLE SHEETS (исправлено для Render) ==========
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(r"C:\zxcvcxz\credentials.json", scope)
+
+# Пробуем получить credentials из переменной окружения
+credentials_json = os.environ.get("CREDENTIALS_JSON")
+
+if credentials_json:
+    # На Render — берём из переменной
+    creds_dict = json.loads(credentials_json)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    print("✅ Credentials загружены из переменной CREDENTIALS_JSON")
+else:
+    # Локально — пробуем файл
+    if os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+        print("✅ Credentials загружены из файла credentials.json")
+    else:
+        raise ValueError("❌ Нет credentials! Установите переменную CREDENTIALS_JSON или положите файл credentials.json")
+
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
-users_ws = sheet.worksheet("Users")      # Лист с колонками: telegram_id, full_name
-chrono_ws = sheet.worksheet("Chrono")    # Лист с колонками: ФИО, Текст, Дата_создания, Дата_изменения
+users_ws = sheet.worksheet("Users")
+chrono_ws = sheet.worksheet("Chrono")
+print("✅ Подключение к Google Sheets установлено")
 
 # ========== КНОПКИ ==========
 main_kb = ReplyKeyboardMarkup(
@@ -53,8 +76,7 @@ class ChronoState(StatesGroup):
     waiting_for_new_text = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-def get_user_name(telegram_id: int) -> str | None:
-    """Возвращает ФИО пользователя по telegram_id из листа Users"""
+def get_user_name(telegram_id: int):
     try:
         cell = users_ws.find(str(telegram_id))
         return users_ws.cell(cell.row, 2).value
@@ -62,49 +84,31 @@ def get_user_name(telegram_id: int) -> str | None:
         return None
 
 def save_user(telegram_id: int, full_name: str):
-    """Сохраняет нового пользователя в лист Users"""
     users_ws.append_row([telegram_id, full_name])
 
-def get_today_record(full_name: str) -> list | None:
-    """Проверяет, есть ли запись за сегодня (только по дате, без времени)"""
+def get_today_record(full_name: str):
     today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     records = chrono_ws.get_all_records()
-    for idx, row in enumerate(records, start=2):  # start=2 пропускает заголовки
-        if row["ФИО"] == full_name and row["Дата и время создания"].startswith(today_str):
+    for idx, row in enumerate(records, start=2):
+        if row["ФИО"] == full_name and str(row["Дата и время создания"]).startswith(today_str):
             return [idx, row["Текст"]]
     return None
 
 def create_record(full_name: str, text: str):
-    """Добавляет новую запись в Chrono"""
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     chrono_ws.append_row([full_name, text, now, ""])
 
 def update_record(row_idx: int, new_text: str):
-    """Обновляет существующую запись: Текст и Дата_изменения"""
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
     chrono_ws.update(f"B{row_idx}", new_text)
     chrono_ws.update(f"D{row_idx}", now)
 
-def get_record_by_date(full_name: str, target_date: str) -> tuple[int, str] | None:
-    """Ищет запись по ФИО и конкретной дате (YYYY-MM-DD)"""
+def get_record_by_date(full_name: str, target_date: str):
     records = chrono_ws.get_all_records()
     for idx, row in enumerate(records, start=2):
-        if row["ФИО"] == full_name and row["Дата и время создания"].startswith(target_date):
+        if row["ФИО"] == full_name and str(row["Дата и время создания"]).startswith(target_date):
             return idx, row["Текст"]
     return None
-
-async def send_reminders(bot: Bot):
-    """Отправляет напоминание в 19:00 всем, у кого нет записи за сегодня"""
-    now_moscow = datetime.now(TIMEZONE)
-    if now_moscow.hour == REMINDER_HOUR and now_moscow.minute == REMINDER_MINUTE:
-        users = users_ws.get_all_records()
-        for user in users:
-            tg_id = int(user["telegram_id"])
-            full_name = user["full_name"]
-            if get_today_record(full_name) is None:
-                img = random.choice(GALLERY)
-                await bot.send_photo(tg_id, img, caption=f"🔔 Напоминание: внеси часы за сегодня, {full_name}!")
-                await bot.send_message(tg_id, "Используй кнопки ниже:", reply_markup=main_kb)
 
 # ========== ХЕНДЛЕРЫ ==========
 bot = Bot(token=TOKEN)
@@ -193,20 +197,9 @@ async def save_edited_chrono(message: types.Message, state: FSMContext):
     await message.answer("✅ Запись обновлена!")
     await state.clear()
 
-# ========== ЗАПУСК НАПОМИНАНИЙ ==========
-async def reminder_loop():
-    await bot.send_message(chat_id="259122642", text="Бот запущен и ждёт 19:00")  # Замените на ваш ID
-    while True:
-        now_moscow = datetime.now(TIMEZONE)
-        next_reminder = datetime.now(TIMEZONE).replace(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, second=0, microsecond=0)
-        if now_moscow >= next_reminder:
-            next_reminder += timedelta(days=1)
-        sleep_seconds = (next_reminder - now_moscow).total_seconds()
-        await asyncio.sleep(sleep_seconds)
-        await send_reminders(bot)
-
+# ========== ЗАПУСК ==========
 async def main():
-    asyncio.create_task(reminder_loop())
+    print("✅ Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
