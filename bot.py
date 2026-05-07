@@ -72,37 +72,41 @@ class ChronoState(StatesGroup):
 # C (3) = Дата и время создания
 # D (4) = Дата и время изменения
 
-def get_user_name(telegram_id: int):
+def get_user_name(tg_id):
     try:
-        cell = users_ws.find(str(telegram_id))
+        cell = users_ws.find(str(tg_id))
         return users_ws.cell(cell.row, 2).value
     except:
         return None
 
-def save_user(telegram_id: int, full_name: str):
-    users_ws.append_row([telegram_id, full_name])
+def save_user(tg_id, name):
+    users_ws.append_row([tg_id, name])
 
-def get_today_record(full_name: str):
-    today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    all_records = chrono_ws.get_all_values()
-    for idx, row in enumerate(all_records, start=1):
-        if idx == 1:  # пропускаем заголовки
-            continue
-        if len(row) >= 3:
-            row_name = row[0]  # столбец A (ФИО)
-            row_date = row[2]  # столбец C (дата создания)
-            if row_name == full_name and row_date.startswith(today_str):
-                return [idx, row[1]]  # возвращаем номер строки и текст из B
+def get_today_record(name):
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    records = chrono_ws.get_all_records()
+    for idx, row in enumerate(records, start=2):
+        if row["ФИО"] == name and str(row["Дата и время создания"]).startswith(today):
+            return idx, row["Текст"]
     return None
 
-def create_record(full_name: str, text: str):
+def create_record(name, text):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    chrono_ws.append_row([full_name, text, now, ""])
+    chrono_ws.append_row([name, text, now, ""])
 
-def update_record(row_idx: int, new_text: str):
+def get_record_by_date(name, target_date):
+    records = chrono_ws.get_all_records()
+    for idx, row in enumerate(records, start=2):
+        created_date = str(row["Дата и время создания"]).split()[0]
+        if row["ФИО"] == name and created_date == target_date:
+            return idx, row["Текст"]
+    return None
+
+def update_record(row_idx, new_text):
     now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    chrono_ws.update(f"B{row_idx}", new_text)
-    chrono_ws.update(f"D{row_idx}", now)
+    # ВАЖНО: двойные квадратные скобки [[значение]]
+    chrono_ws.update(f"B{row_idx}", [[new_text]])
+    chrono_ws.update(f"D{row_idx}", [[now]])
 
 def get_record_by_date(full_name: str, target_date: str):
     all_records = chrono_ws.get_all_values()
