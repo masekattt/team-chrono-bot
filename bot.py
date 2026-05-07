@@ -65,7 +65,13 @@ class ChronoState(StatesGroup):
     waiting_for_edit_date = State()
     waiting_for_new_text = State()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (работа с индексами столбцов) ==========
+# Столбцы в листе Chrono:
+# A (1) = ФИО
+# B (2) = Текст
+# C (3) = Дата и время создания
+# D (4) = Дата и время изменения
+
 def get_user_name(telegram_id: int):
     try:
         cell = users_ws.find(str(telegram_id))
@@ -78,10 +84,15 @@ def save_user(telegram_id: int, full_name: str):
 
 def get_today_record(full_name: str):
     today_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    records = chrono_ws.get_all_records()
-    for idx, row in enumerate(records, start=2):
-        if row["ФИО"] == full_name and str(row["Дата и время создания"]).startswith(today_str):
-            return [idx, row["Текст"]]
+    all_records = chrono_ws.get_all_values()
+    for idx, row in enumerate(all_records, start=1):
+        if idx == 1:  # пропускаем заголовки
+            continue
+        if len(row) >= 3:
+            row_name = row[0]  # столбец A (ФИО)
+            row_date = row[2]  # столбец C (дата создания)
+            if row_name == full_name and row_date.startswith(today_str):
+                return [idx, row[1]]  # возвращаем номер строки и текст из B
     return None
 
 def create_record(full_name: str, text: str):
@@ -94,11 +105,15 @@ def update_record(row_idx: int, new_text: str):
     chrono_ws.update(f"D{row_idx}", now)
 
 def get_record_by_date(full_name: str, target_date: str):
-    records = chrono_ws.get_all_records()
-    for idx, row in enumerate(records, start=2):
-        created_date = str(row["Дата и время создания"]).split(" ")[0]
-        if row["ФИО"] == full_name and created_date == target_date:
-            return idx, row["Текст"]
+    all_records = chrono_ws.get_all_values()
+    for idx, row in enumerate(all_records, start=1):
+        if idx == 1:
+            continue
+        if len(row) >= 3:
+            row_name = row[0]      # A: ФИО
+            row_date = row[2]      # C: дата создания, берём только первые 10 символов (YYYY-MM-DD)
+            if row_name == full_name and row_date.startswith(target_date):
+                return [idx, row[1]]  # возвращаем номер строки и текст из B
     return None
 
 # ========== ХЕНДЛЕРЫ ==========
@@ -134,7 +149,7 @@ async def add_chrono(message: types.Message, state: FSMContext):
     if get_today_record(full_name):
         await message.answer("❌ Ты уже вводил задачи сегодня. Используй кнопку «Изменить часы».")
         return
-    await message.answer("📝 Отправь список задач на сегодня (каждую с новой строки):")
+    await message.answer("📝 Отправь список задач на сегодня (каждую с новой строки):\nПример:\n1. Общался с ИИ — 2ч\n2. Резал морковь — 24ч")
     await state.set_state(ChronoState.waiting_for_text)
     await state.update_data(full_name=full_name)
 
