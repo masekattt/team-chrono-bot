@@ -32,7 +32,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN is not set")
 
-SHEET_ID = "1A2b3C4d5E6f7G8h9I0j"
+SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"
 
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
