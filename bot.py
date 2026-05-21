@@ -32,7 +32,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не установлен!")
 
-SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"  # ⚠️ ЗАМЕНИТЕ НА ВАШ ID
+SHEET_ID = "1A2b3C4d5E6f7G8h9I0j"  # ⚠️ ЗАМЕНИТЕ НА ВАШ ID ТАБЛИЦЫ
 
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
@@ -65,6 +65,16 @@ main_kb = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Клавиатура для выбора даты (сегодня/вчера/другая)
+date_choice_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Сегодня")],
+        [KeyboardButton(text="📆 Вчера")],
+        [KeyboardButton(text="📅 Другая дата")]
+    ],
+    resize_keyboard=True
+)
+
 # ========== ШАБЛОНЫ ИЗ GOOGLE TABLES ==========
 TEMPLATES_SHEET_NAME = "Templates"
 
@@ -86,7 +96,7 @@ def load_templates_from_sheet():
         return ["Очная встреча", "Проверка багов", "Написание кода"]
 
 def get_template_keyboard():
-    """Создаёт клавиатуру с шаблонами задач (без встроенных часов)"""
+    """Создаёт клавиатуру с шаблонами задач"""
     templates = load_templates_from_sheet()
     keyboard = []
     row = []
@@ -106,10 +116,11 @@ class RegisterState(StatesGroup):
     waiting_for_name = State()
 
 class ChronoState(StatesGroup):
-    waiting_for_which_day = State()
-    waiting_for_edit_date = State()
-    waiting_for_template_builder = State()
-    waiting_for_hours_input = State()
+    waiting_for_which_day = State()       # Выбор даты (сегодня/вчера/другая)
+    waiting_for_custom_date = State()     # Ввод произвольной даты
+    waiting_for_edit_date = State()       # Ввод даты для редактирования
+    waiting_for_template_builder = State() # Выбор шаблонов
+    waiting_for_hours_input = State()     # Ввод часов
 
 # ========== РАБОТА С ТАБЛИЦЕЙ ==========
 def get_user_name(tg_id):
@@ -132,7 +143,7 @@ def get_record_by_date_and_name(name, target_date):
     return None
 
 def create_record(name, text, date_override=None):
-    """Создаёт запись. Если date_override указан (YYYY-MM-DD), использует его"""
+    """Создаёт запись. Если date_override указан, использует его"""
     if date_override:
         dt = datetime.strptime(date_override, "%Y-%m-%d")
         record_datetime = dt.replace(hour=23, minute=59, second=59)
@@ -151,6 +162,7 @@ def update_record(row_idx, new_text):
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# ---------- РЕГИСТРАЦИЯ ----------
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
     tg_id = msg.from_user.id
@@ -171,7 +183,7 @@ async def process_name(msg: types.Message, state: FSMContext):
     await msg.answer(f"Принято, {name}!", reply_markup=main_kb)
     await state.clear()
 
-# ========== ВВОД ЧАСОВ ==========
+# ---------- ВВОД ЧАСОВ ----------
 @dp.message(lambda m: m.text == "✍️ Ввести часы")
 async def add_chrono_start(msg: types.Message, state: FSMContext):
     name = get_user_name(msg.from_user.id)
@@ -183,40 +195,76 @@ async def add_chrono_start(msg: types.Message, state: FSMContext):
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     existing = get_record_by_date_and_name(name, today)
     if existing:
-        await msg.answer("❌ Сегодня уже введено. Используй «✏️ Изменить часы»")
+        await msg.answer("❌ За сегодня уже введено. Используй «✏️ Изменить часы»")
         return
     
-    await msg.answer("📅 Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):")
+    await msg.answer(
+        "📅 За какую дату хочешь внести часы?",
+        reply_markup=date_choice_kb
+    )
     await state.set_state(ChronoState.waiting_for_which_day)
     await state.update_data(full_name=name, is_edit=False, accumulated_text="")
 
 @dp.message(ChronoState.waiting_for_which_day)
-async def process_date_for_add(msg: types.Message, state: FSMContext):
+async def process_date_choice(msg: types.Message, state: FSMContext):
+    choice = msg.text
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    data = await state.get_data()
+    name = data["full_name"]
+    
+    if choice == "✅ Сегодня":
+        target_date = today
+        await proceed_with_date(msg, state, target_date, name)
+    elif choice == "📆 Вчера":
+        target_date = yesterday
+        await proceed_with_date(msg, state, target_date, name)
+    elif choice == "📅 Другая дата":
+        await msg.answer(
+            "📅 Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        await state.set_state(ChronoState.waiting_for_custom_date)
+    else:
+        await msg.answer("❌ Используй кнопки для выбора даты")
+        return
+
+@dp.message(ChronoState.waiting_for_custom_date)
+async def process_custom_date(msg: types.Message, state: FSMContext):
     date_str = msg.text.strip()
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
     except:
         await msg.answer("❌ Неверный формат. Используй ГГГГ-ММ-ДД")
         return
     
-    data = await state.get_data()
-    name = data["full_name"]
-    
-    # Проверяем, не пытается ли пользователь ввести дату в будущем
-    if date_str > datetime.now(TIMEZONE).strftime("%Y-%m-%d"):
-        await msg.answer("❌ Нельзя вводить часы за будущие даты")
-        return
-    
-    # Проверяем, нет ли уже записи за эту дату
-    existing = get_record_by_date_and_name(name, date_str)
-    if existing:
-        await msg.answer(f"❌ Запись за {date_str} уже существует. Используй «✏️ Изменить часы»")
+    if date_str > today:
+        await msg.answer("❌ Нельзя вводить часы за будущие даты", reply_markup=main_kb)
         await state.clear()
         return
     
-    await state.update_data(target_date=date_str)
+    data = await state.get_data()
+    name = data["full_name"]
+    await proceed_with_date(msg, state, date_str, name)
+
+async def proceed_with_date(msg: types.Message, state: FSMContext, target_date: str, name: str):
+    """Продолжает после выбора даты: проверяет дубликат и показывает шаблоны"""
+    # Проверяем, нет ли уже записи за эту дату
+    existing = get_record_by_date_and_name(name, target_date)
+    if existing:
+        await msg.answer(
+            f"❌ Запись за {target_date} уже существует. Используй «✏️ Изменить часы»",
+            reply_markup=main_kb
+        )
+        await state.clear()
+        return
+    
+    await state.update_data(target_date=target_date)
     await msg.answer(
-        f"📅 *{date_str}*\n\n"
+        f"📅 *{target_date}*\n\n"
         f"➕ Нажимай на кнопки с задачами.\n"
         f"После каждой кнопки введи количество часов.\n"
         f"Когда закончишь — нажми «✅ Готово»",
@@ -225,7 +273,7 @@ async def process_date_for_add(msg: types.Message, state: FSMContext):
     )
     await state.set_state(ChronoState.waiting_for_template_builder)
 
-# ========== ИЗМЕНЕНИЕ ЧАСОВ ==========
+# ---------- ИЗМЕНЕНИЕ ЧАСОВ ----------
 @dp.message(lambda m: m.text == "✏️ Изменить часы")
 async def edit_chrono_start(msg: types.Message, state: FSMContext):
     name = get_user_name(msg.from_user.id)
@@ -233,7 +281,10 @@ async def edit_chrono_start(msg: types.Message, state: FSMContext):
         await msg.answer("Сначала /start")
         return
     
-    await msg.answer("📅 Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):")
+    await msg.answer(
+        "📅 Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
     await state.set_state(ChronoState.waiting_for_edit_date)
     await state.update_data(full_name=name)
 
@@ -251,7 +302,7 @@ async def process_date_for_edit(msg: types.Message, state: FSMContext):
     
     record = get_record_by_date_and_name(name, date_str)
     if not record:
-        await msg.answer(f"❌ Нет записей за {date_str}")
+        await msg.answer(f"❌ Нет записей за {date_str}", reply_markup=main_kb)
         await state.clear()
         return
     
@@ -275,7 +326,7 @@ async def process_date_for_edit(msg: types.Message, state: FSMContext):
     )
     await state.set_state(ChronoState.waiting_for_template_builder)
 
-# ========== КОНСТРУКТОР ЗАДАЧ ==========
+# ---------- КОНСТРУКТОР ЗАДАЧ ----------
 @dp.message(ChronoState.waiting_for_template_builder)
 async def template_handler(msg: types.Message, state: FSMContext):
     templates = load_templates_from_sheet()
@@ -324,7 +375,7 @@ async def template_handler(msg: types.Message, state: FSMContext):
 async def hours_input_handler(msg: types.Message, state: FSMContext):
     hours = msg.text.strip()
     
-    # Валидация
+    # Валидация числа
     try:
         hours_clean = hours.replace(',', '.')
         hours_float = float(hours_clean)
@@ -334,16 +385,24 @@ async def hours_input_handler(msg: types.Message, state: FSMContext):
         await msg.answer("❌ Введи корректное число часов (например: 2, 1.5, 3.75)")
         return
     
-    hours_str = str(hours_float).replace('.', ',')
-    
     data = await state.get_data()
     template = data.get("current_template")
+    
+    if not template:
+        await msg.answer(
+            "❌ Что-то пошло не так. Пожалуйста, выбери задачу заново:",
+            reply_markup=get_template_keyboard()
+        )
+        await state.set_state(ChronoState.waiting_for_template_builder)
+        return
+    
     accumulated = data.get("accumulated_text", "")
     
     # Нумерация
     lines = accumulated.strip().split('\n') if accumulated else []
     next_num = len([l for l in lines if l.strip()]) + 1
     
+    hours_str = str(hours_float).replace('.', ',')
     new_line = f"{next_num}. {template} — {hours_str} часа"
     
     if accumulated:
@@ -351,7 +410,7 @@ async def hours_input_handler(msg: types.Message, state: FSMContext):
     else:
         accumulated = new_line
     
-    await state.update_data(accumulated_text=accumulated)
+    await state.update_data(accumulated_text=accumulated, current_template=None)
     
     await msg.answer(
         f"📝 *Текущий список:*\n{accumulated}\n\n"
@@ -361,7 +420,7 @@ async def hours_input_handler(msg: types.Message, state: FSMContext):
     )
     await state.set_state(ChronoState.waiting_for_template_builder)
 
-# ========== НАПОМИНАНИЯ ==========
+# ---------- НАПОМИНАНИЯ ----------
 async def reminder_loop():
     while True:
         now = datetime.now(TIMEZONE)
@@ -385,7 +444,7 @@ async def reminder_loop():
             except Exception as e:
                 print(f"Ошибка напоминания: {e}")
 
-# ========== ЗАПУСК ==========
+# ---------- ЗАПУСК ----------
 async def main():
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
