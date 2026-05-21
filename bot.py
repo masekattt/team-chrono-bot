@@ -4,7 +4,7 @@ import asyncio
 import gspread
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from oauth2client.service_account import ServiceAccountCredentials
 import pytz
 import json
+import re
 
 # ========== ВЕБ-СЕРВЕР ДЛЯ RENDER ==========
 from flask import Flask
@@ -21,7 +22,7 @@ web_app = Flask(__name__)
 
 @web_app.route('/')
 def health_check():
-    return "Bot is working", 200
+    return "Бот работает!", 200
 
 def run_web_server():
     port = int(os.environ.get('PORT', 10000))
@@ -30,10 +31,9 @@ def run_web_server():
 # ========== КОНФИГУРАЦИЯ ==========
 TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
-    raise ValueError("BOT_TOKEN is not set")
+    raise ValueError("BOT_TOKEN не установлен")
 
 SHEET_ID = "1pKNd-VfzUEK3A7D-p1lZTGpvZHtO7UPIRevn4YZqSSQ"
-
 TIMEZONE = pytz.timezone("Europe/Moscow")
 REMINDER_HOUR = 19
 REMINDER_MINUTE = 0
@@ -48,8 +48,10 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds_json = os.environ.get("CREDENTIALS_JSON")
 if creds_json:
     creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(creds_json), scope)
+    print("Учетные данные из CREDENTIALS_JSON")
 else:
     creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    print("Учетные данные из файла")
 
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
@@ -60,87 +62,107 @@ templates_ws = sheet.worksheet("Templates")
 # ========== КНОПКИ ==========
 main_kb = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="Ввести часы")],
-        [KeyboardButton(text="Изменить часы")]
+        [KeyboardButton(text="Создать запись")],
+        [KeyboardButton(text="Редактировать запись")]
     ],
     resize_keyboard=True
 )
 
-date_choice_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Сегодня")],
-        [KeyboardButton(text="Вчера")],
-        [KeyboardButton(text="Другая дата")]
-    ],
+cancel_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="Отмена")]],
     resize_keyboard=True
 )
 
-def get_main_list_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Добавить задачу")],
-            [KeyboardButton(text="Редактировать строку")],
-            [KeyboardButton(text="Удалить строку")],
-            [KeyboardButton(text="Готово")],
-            [KeyboardButton(text="Отмена")]
-        ],
-        resize_keyboard=True
-    )
-
-def get_add_method_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Шаблон")],
-            [KeyboardButton(text="Другие активности")],
-            [KeyboardButton(text="Назад к списку")]
-        ],
-        resize_keyboard=True
-    )
-
-# ========== ШАБЛОНЫ ==========
-def load_templates_from_sheet():
-    try:
-        records = templates_ws.get_all_records()
-        templates = []
-        for row in records:
-            name = row.get("name", "").strip()
-            if name:
-                templates.append(name)
-        if not templates:
-            templates = ["Очная встреча", "Проверка багов", "Написание кода"]
-        return templates
-    except Exception as e:
-        print(f"Ошибка загрузки шаблонов: {e}")
-        return ["Очная встреча", "Проверка багов", "Написание кода"]
-
-def get_template_keyboard():
-    templates = load_templates_from_sheet()
-    keyboard = []
-    row = []
-    for i, template in enumerate(templates):
-        row.append(KeyboardButton(text=template))
-        if len(row) == 2 or i == len(templates) - 1:
-            keyboard.append(row)
-            row = []
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
-
-# ========== FSM ==========
+# ========== FSM СОСТОЯНИЯ ==========
 class RegisterState(StatesGroup):
     waiting_for_name = State()
 
-class ChronoState(StatesGroup):
-    waiting_for_date = State()
-    waiting_for_custom_date = State()
-    waiting_for_edit_date = State()
-    waiting_for_main = State()
-    waiting_for_add_method = State()
-    waiting_for_template_hours = State()
-    waiting_for_custom_text = State()
-    waiting_for_edit_line_num = State()
-    waiting_for_edit_line_text = State()
-    waiting_for_delete_line_num = State()
+class RecordState(StatesGroup):
+    choosing_date = State()
+    building_task = State()
+    editing_task = State()
+    selecting_line_to_edit = State()
+    editing_line = State()
+    selecting_line_to_delete = State()
 
-# ========== РАБОТА С ТАБЛИЦЕЙ ==========
+# ========== РАБОТА С ШАБЛОНАМИ ==========
+def get_templates():
+    """Получает список шаблонов из таблицы Templates (только столбец name)"""
+    try:
+        # Получаем все значения из первого столбца (A)
+        names = templates_ws.col_values(1)
+        # Пропускаем заголовок если он есть
+        templates = [name.strip() for name in names if name.strip() and name.strip().lower() != "name"]
+        return templates
+    except Exception as e:
+        print(f"Ошибка загрузки шаблонов: {e}")
+        return []
+
+def create_templates_keyboard(templates):
+    """Создает клавиатуру с шаблонами (по 2 кнопки в ряд)"""
+    keyboard = []
+    row = []
+    for template in templates:
+        row.append(InlineKeyboardButton(
+            text=template,
+            callback_data=f"template_{template}"
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton(text="Другая активность", callback_data="template_other")])
+    keyboard.append([InlineKeyboardButton(text="Готово", callback_data="done_building")])
+    keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_building")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def create_edit_keyboard():
+    """Создает клавиатуру для управления задачами"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Добавить задачу", callback_data="add_task")],
+        [InlineKeyboardButton(text="Редактировать строку", callback_data="edit_line")],
+        [InlineKeyboardButton(text="Удалить строку", callback_data="delete_line")],
+        [InlineKeyboardButton(text="Завершить", callback_data="finish_recording")]
+    ])
+    return keyboard
+
+def create_line_delete_keyboard(lines):
+    """Создает клавиатуру для выбора строки для удаления"""
+    keyboard = []
+    for i, line in enumerate(lines):
+        preview = line[:30] + "..." if len(line) > 30 else line
+        keyboard.append([InlineKeyboardButton(
+            text=f"{i+1}. {preview}",
+            callback_data=f"select_delete_{i}"
+        )])
+    keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="delete_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# ========== РАБОТА С ЗАПИСЯМИ ==========
+def parse_tasks_to_text(tasks):
+    """Преобразует список задач в текст с нумерацией"""
+    if not tasks:
+        return ""
+    text_lines = []
+    for i, task in enumerate(tasks, 1):
+        text_lines.append(f"{i}. {task}")
+    return "\n".join(text_lines)
+
+def parse_text_to_tasks(text):
+    """Преобразует текст с нумерацией обратно в список задач"""
+    if not text:
+        return []
+    tasks = []
+    lines = text.strip().split('\n')
+    for line in lines:
+        cleaned = re.sub(r'^\d+\.\s*', '', line.strip())
+        if cleaned:
+            tasks.append(cleaned)
+    return tasks
+
 def get_user_name(tg_id):
     try:
         cell = users_ws.find(str(tg_id))
@@ -154,18 +176,14 @@ def save_user(tg_id, name):
 def get_record_by_date_and_name(name, target_date):
     records = chrono_ws.get_all_records()
     for idx, row in enumerate(records, start=2):
-        created_date = str(row.get("Дата и время создания", "")).split()[0]
+        created_date = str(row.get("Дата", "")).split()[0]
         if row.get("ФИО") == name and created_date == target_date:
             return idx, row.get("Текст", "")
     return None
 
-def create_record(name, text, date_override=None):
-    if date_override:
-        dt = datetime.strptime(date_override, "%Y-%m-%d")
-        record_datetime = dt.replace(hour=23, minute=59, second=59)
-        record_str = record_datetime.strftime("%Y-%m-%d %H:%M:%S")
-    else:
-        record_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+def create_record(name, text, target_date):
+    record_datetime = datetime.strptime(target_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    record_str = record_datetime.strftime("%Y-%m-%d %H:%M:%S")
     chrono_ws.append_row([name, text, record_str, ""])
 
 def update_record(row_idx, new_text):
@@ -173,31 +191,20 @@ def update_record(row_idx, new_text):
     chrono_ws.update([[new_text]], f"B{row_idx}")
     chrono_ws.update([[now]], f"D{row_idx}")
 
-def add_line_to_list(accumulated, task_name, hours_str):
-    lines = accumulated.strip().split('\n') if accumulated else []
-    next_num = len([l for l in lines if l.strip()]) + 1
-    return f"{next_num}. {task_name} - {hours_str} часа"
-
-async def show_main_menu(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    accumulated = data.get("accumulated_text", "").strip()
-    
-    if not accumulated:
-        await msg.answer(
-            "Список задач пуст. Нажми Добавить задачу",
-            reply_markup=get_main_list_keyboard()
-        )
-    else:
-        await msg.answer(
-            f"Текущий список:\n{accumulated}\n\nВыбери действие:",
-            reply_markup=get_main_list_keyboard()
-        )
+def get_all_user_dates(name):
+    records = chrono_ws.get_all_records()
+    dates = []
+    for row in records:
+        if row.get("ФИО") == name:
+            date_str = str(row.get("Дата", "")).split()[0]
+            if date_str and date_str not in dates:
+                dates.append(date_str)
+    return sorted(dates, reverse=True)
 
 # ========== ХЕНДЛЕРЫ ==========
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ---------- РЕГИСТРАЦИЯ ----------
 @dp.message(Command("start"))
 async def cmd_start(msg: types.Message, state: FSMContext):
     tg_id = msg.from_user.id
@@ -218,344 +225,433 @@ async def process_name(msg: types.Message, state: FSMContext):
     await msg.answer(f"Принято, {name}!", reply_markup=main_kb)
     await state.clear()
 
-# ---------- ВВОД ЧАСОВ ----------
-@dp.message(lambda m: m.text == "Ввести часы")
-async def add_chrono_start(msg: types.Message, state: FSMContext):
+# ========== СОЗДАНИЕ ЗАПИСИ ==========
+@dp.message(lambda m: m.text == "Создать запись")
+async def create_record_start(msg: types.Message, state: FSMContext):
     name = get_user_name(msg.from_user.id)
     if not name:
-        await msg.answer("Сначала /start")
+        await msg.answer("Сначала используй /start")
         return
     
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    existing = get_record_by_date_and_name(name, today)
-    if existing:
-        await msg.answer("За сегодня уже введено. Используй Изменить часы")
-        return
-    
-    # ВАЖНО: теперь бот СПРАШИВАЕТ дату
-    await msg.answer(
-        "За какую дату хочешь внести часы?",
-        reply_markup=date_choice_kb
-    )
-    await state.set_state(ChronoState.waiting_for_date)
-    await state.update_data(full_name=name, is_edit=False, accumulated_text="")
-
-@dp.message(ChronoState.waiting_for_date)
-async def process_date_choice(msg: types.Message, state: FSMContext):
-    choice = msg.text
     today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
     yesterday = (datetime.now(TIMEZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
-    data = await state.get_data()
-    name = data["full_name"]
     
-    if choice == "Сегодня":
-        target_date = today
-    elif choice == "Вчера":
-        target_date = yesterday
-    elif choice == "Другая дата":
-        await msg.answer(
-            "Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        await state.set_state(ChronoState.waiting_for_custom_date)
-        return
-    else:
-        await msg.answer("Используй кнопки для выбора даты")
-        return
-    
-    existing = get_record_by_date_and_name(name, target_date)
-    if existing:
-        await msg.answer(f"Запись за {target_date} уже существует", reply_markup=main_kb)
-        await state.clear()
-        return
-    
-    await state.update_data(target_date=target_date)
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
-
-# ---------- ИЗМЕНЕНИЕ ЧАСОВ ----------
-@dp.message(lambda m: m.text == "Изменить часы")
-async def edit_chrono_start(msg: types.Message, state: FSMContext):
-    name = get_user_name(msg.from_user.id)
-    if not name:
-        await msg.answer("Сначала /start")
-        return
-    
-    await msg.answer(
-        "Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
-        reply_markup=types.ReplyKeyboardRemove()
-    )
-    await state.set_state(ChronoState.waiting_for_edit_date)
-    await state.update_data(full_name=name)
-
-@dp.message(ChronoState.waiting_for_edit_date)
-async def process_date_for_edit(msg: types.Message, state: FSMContext):
-    date_str = msg.text.strip()
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except:
-        await msg.answer("Неверный формат. Используй ГГГГ-ММ-ДД")
-        return
-    
-    data = await state.get_data()
-    name = data["full_name"]
-    
-    record = get_record_by_date_and_name(name, date_str)
-    if not record:
-        await msg.answer(f"Нет записей за {date_str}", reply_markup=main_kb)
-        await state.clear()
-        return
-    
-    row_idx, old_text = record
-    await state.update_data(
-        target_date=date_str,
-        row_idx=row_idx,
-        is_edit=True,
-        accumulated_text=old_text + "\n" if old_text else ""
+    date_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=today)],
+            [KeyboardButton(text=yesterday)],
+            [KeyboardButton(text="Отмена")]
+        ],
+        resize_keyboard=True
     )
     
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
+    await state.update_data(full_name=name, tasks=[], edit_mode=False)
+    await msg.answer(f"Выбери дату для записи:", reply_markup=date_kb)
+    await state.set_state(RecordState.choosing_date)
 
-# ---------- ОСНОВНОЕ МЕНЮ ----------
-@dp.message(ChronoState.waiting_for_main)
-async def main_list_handler(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    
-    if msg.text == "Готово":
-        final_text = data.get("accumulated_text", "").strip()
-        if not final_text:
-            await msg.answer("Список пуст. Добавь хотя бы одну задачу.")
-            return
-        
-        name = data["full_name"]
-        target_date = data["target_date"]
-        
-        if data.get("is_edit"):
-            update_record(data["row_idx"], final_text)
-            await msg.answer(f"Запись за {target_date} обновлена!", reply_markup=main_kb)
-        else:
-            create_record(name, final_text, date_override=target_date)
-            await msg.answer(f"Запись за {target_date} сохранена!", reply_markup=main_kb)
-        
-        await state.clear()
-        return
-    
+@dp.message(RecordState.choosing_date)
+async def process_date_selection(msg: types.Message, state: FSMContext):
     if msg.text == "Отмена":
         await msg.answer("Отменено", reply_markup=main_kb)
         await state.clear()
         return
     
-    if msg.text == "Добавить задачу":
-        await msg.answer(
-            "Выбери способ добавления:",
-            reply_markup=get_add_method_keyboard()
-        )
-        await state.set_state(ChronoState.waiting_for_add_method)
-        return
-    
-    if msg.text == "Редактировать строку":
-        accumulated = data.get("accumulated_text", "")
-        lines = [l for l in accumulated.split('\n') if l.strip()]
-        
-        if not lines:
-            await msg.answer("Нет строк для редактирования")
-            await show_main_menu(msg, state)
-            return
-        
-        numbered = "\n".join([f"{i+1}. {line}" for i, line in enumerate(lines)])
-        await msg.answer(
-            f"Введи номер строки для редактирования:\n{numbered}",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        await state.set_state(ChronoState.waiting_for_edit_line_num)
-        return
-    
-    if msg.text == "Удалить строку":
-        accumulated = data.get("accumulated_text", "")
-        lines = [l for l in accumulated.split('\n') if l.strip()]
-        
-        if not lines:
-            await msg.answer("Нет строк для удаления")
-            await show_main_menu(msg, state)
-            return
-        
-        numbered = "\n".join([f"{i+1}. {line}" for i, line in enumerate(lines)])
-        await msg.answer(
-            f"Введи номер строки для удаления:\n{numbered}",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        await state.set_state(ChronoState.waiting_for_delete_line_num)
-        return
-    
-    await msg.answer("Используй кнопки", reply_markup=get_main_list_keyboard())
-
-# ---------- ДОБАВЛЕНИЕ ЗАДАЧ ----------
-@dp.message(ChronoState.waiting_for_add_method)
-async def add_method_handler(msg: types.Message, state: FSMContext):
-    if msg.text == "Назад к списку":
-        await show_main_menu(msg, state)
-        await state.set_state(ChronoState.waiting_for_main)
-        return
-    
-    if msg.text == "Шаблон":
-        await msg.answer("Выбери шаблон:", reply_markup=get_template_keyboard())
-        await state.set_state(ChronoState.waiting_for_template_hours)
-        return
-    
-    if msg.text == "Другие активности":
-        await msg.answer(
-            "Расскажи, что выходящего за рамки ты сегодня сделал.\n\n"
-            "Формат: Название задачи - часы\n"
-            "Пример: Документация - 1,5 часа\n\n"
-            "Ты можешь написать сразу несколько задач, каждую с новой строки.",
-            reply_markup=types.ReplyKeyboardRemove()
-        )
-        await state.set_state(ChronoState.waiting_for_custom_text)
-        return
-
-@dp.message(ChronoState.waiting_for_template_hours)
-async def template_choice_handler(msg: types.Message, state: FSMContext):
-    templates = load_templates_from_sheet()
-    
-    if msg.text in templates:
-        await state.update_data(current_template=msg.text)
-        await msg.answer(f"Введи количество часов для: {msg.text}")
-        return
-    
     try:
-        hours_clean = msg.text.replace(',', '.')
-        hours_float = float(hours_clean)
-        if hours_float <= 0:
-            raise ValueError
-    except ValueError:
-        await msg.answer("Выбери шаблон или введи число часов", reply_markup=get_template_keyboard())
-        return
-    
-    data = await state.get_data()
-    template = data.get("current_template")
-    if not template:
-        await msg.answer("Сначала выбери шаблон", reply_markup=get_template_keyboard())
-        return
-    
-    accumulated = data.get("accumulated_text", "")
-    hours_str = str(hours_float).replace('.', ',')
-    new_line = add_line_to_list(accumulated, template, hours_str)
-    
-    if accumulated:
-        accumulated += "\n" + new_line
-    else:
-        accumulated = new_line
-    
-    await state.update_data(accumulated_text=accumulated, current_template=None)
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
-
-@dp.message(ChronoState.waiting_for_custom_text)
-async def custom_text_handler(msg: types.Message, state: FSMContext):
-    text = msg.text.strip()
-    if len(text) < 5:
-        await msg.answer("Слишком коротко. Напиши хотя бы одну задачу.")
-        return
-    
-    data = await state.get_data()
-    accumulated = data.get("accumulated_text", "")
-    
-    lines = accumulated.strip().split('\n') if accumulated else []
-    next_num = len([l for l in lines if l.strip()]) + 1
-    
-    custom_lines = text.split('\n')
-    new_lines = []
-    for line in custom_lines:
-        if line.strip():
-            new_lines.append(f"{next_num}. {line.strip()}")
-            next_num += 1
-    
-    if accumulated:
-        accumulated += "\n" + "\n".join(new_lines)
-    else:
-        accumulated = "\n".join(new_lines)
-    
-    await state.update_data(accumulated_text=accumulated)
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
-
-# ---------- РЕДАКТИРОВАНИЕ И УДАЛЕНИЕ ----------
-@dp.message(ChronoState.waiting_for_edit_line_num)
-async def edit_line_num_handler(msg: types.Message, state: FSMContext):
-    try:
-        line_num = int(msg.text.strip()) - 1
+        datetime.strptime(msg.text, "%Y-%m-%d")
+        target_date = msg.text
     except:
-        await msg.answer("Введи номер строки")
+        await msg.answer("Неверный формат даты. Используй ГГГГ-ММ-ДД или нажми на кнопку")
         return
     
     data = await state.get_data()
-    accumulated = data.get("accumulated_text", "")
-    lines = [l for l in accumulated.split('\n') if l.strip()]
+    name = data["full_name"]
+    edit_mode = data.get("edit_mode", False)
     
-    if line_num < 0 or line_num >= len(lines):
-        await msg.answer(f"Строка {line_num+1} не найдена. Всего строк: {len(lines)}")
+    if not edit_mode:
+        existing = get_record_by_date_and_name(name, target_date)
+        if existing:
+            row_idx, old_text = existing
+            await msg.answer(
+                f"Запись за {target_date} уже существует:\n\n{old_text}\n\n"
+                f"Используй кнопку «Редактировать запись»",
+                reply_markup=main_kb
+            )
+            await state.clear()
+            return
+    
+    await state.update_data(target_date=target_date, tasks=[], original_row_idx=None)
+    
+    templates = get_templates()
+    if templates:
+        await msg.answer(
+            f"Создание записи за {target_date}\n\n"
+            f"Выбери задачу или используй «Другая активность»:",
+            reply_markup=create_templates_keyboard(templates)
+        )
+    else:
+        await msg.answer(
+            f"Создание записи за {target_date}\n\n"
+            f"Отправь задачу в формате: Дело - Часы\n"
+            f"Пример: Встреча - 2",
+            reply_markup=cancel_kb
+        )
+    await state.set_state(RecordState.building_task)
+
+@dp.callback_query(RecordState.building_task)
+async def process_template_selection(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if callback.data == "cancel_building":
+        await callback.message.edit_text("Отменено")
+        await callback.message.answer("Главное меню:", reply_markup=main_kb)
+        await state.clear()
         return
     
-    await state.update_data(edit_line_num=line_num)
-    await msg.answer(
-        f"Текущая строка:\n{lines[line_num]}\n\nВведи новый текст для этой строки:"
+    if callback.data == "done_building":
+        await finish_building(callback.message, state)
+        return
+    
+    data = await state.get_data()
+    tasks = data.get("tasks", [])
+    
+    if callback.data == "template_other":
+        await callback.message.edit_text(
+            "Отправь свою задачу в формате:\nДело - Часы\n\n"
+            "Пример: Проверка кода - 1.5\n\n"
+            "Или нажми Отмена",
+            reply_markup=cancel_kb
+        )
+        return
+    
+    if callback.data.startswith("template_"):
+        template_name = callback.data.replace("template_", "")
+        tasks.append(f"{template_name} - ")
+        await state.update_data(tasks=tasks)
+        
+        tasks_text = parse_tasks_to_text(tasks)
+        templates = get_templates()
+        
+        await callback.message.edit_text(
+            f"Дата: {data.get('target_date')}\n\n"
+            f"Текущий список:\n{tasks_text}\n\n"
+            f"Выбери следующую задачу или укажи часы для последней:",
+            reply_markup=create_templates_keyboard(templates)
+        )
+        await state.set_state(RecordState.building_task)
+
+@dp.message(RecordState.building_task)
+async def process_task_hours(msg: types.Message, state: FSMContext):
+    if msg.text == "Отмена":
+        await msg.answer("Отменено", reply_markup=main_kb)
+        await state.clear()
+        return
+    
+    data = await state.get_data()
+    tasks = data.get("tasks", [])
+    
+    if not tasks:
+        await msg.answer("Сначала выбери задачу из кнопок ниже")
+        return
+    
+    last_task = tasks[-1]
+    if last_task.endswith(" - "):
+        hours_input = msg.text.strip()
+        try:
+            hours = float(hours_input.replace(',', '.'))
+            if hours < 0 or hours > 24:
+                await msg.answer("Часы должны быть от 0 до 24")
+                return
+            
+            if hours == int(hours):
+                hours_str = str(int(hours))
+            else:
+                hours_str = str(hours)
+            
+            tasks[-1] = f"{last_task}{hours_str} ч"
+            await state.update_data(tasks=tasks)
+            
+            tasks_text = parse_tasks_to_text(tasks)
+            templates = get_templates()
+            
+            await msg.answer(
+                f"Дата: {data.get('target_date')}\n\n"
+                f"Текущий список:\n{tasks_text}\n\n"
+                f"Выбери следующую задачу или нажми Готово:",
+                reply_markup=create_templates_keyboard(templates)
+            )
+        except ValueError:
+            await msg.answer("Неверный формат часов. Отправь число (например, 2 или 1.5)")
+    else:
+        await msg.answer("Что-то пошло не так. Начни заново через Создать запись")
+
+async def finish_building(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    tasks = data.get("tasks", [])
+    target_date = data.get("target_date")
+    name = data.get("full_name")
+    row_idx = data.get("original_row_idx")
+    edit_mode = data.get("edit_mode", False)
+    
+    if not tasks:
+        await message.answer("Задачи не добавлены. Отменено.", reply_markup=main_kb)
+        await state.clear()
+        return
+    
+    incomplete_tasks = [t for t in tasks if t.endswith(" - ")]
+    if incomplete_tasks:
+        await message.answer(
+            f"Укажи часы для:\n{chr(10).join(incomplete_tasks)}\n\n"
+            f"Отправь часы для последней задачи"
+        )
+        return
+    
+    tasks_text = parse_tasks_to_text(tasks)
+    
+    if edit_mode and row_idx:
+        update_record(row_idx, tasks_text)
+        await message.answer(
+            f"Запись за {target_date} обновлена!\n\n{tasks_text}",
+            reply_markup=main_kb
+        )
+    else:
+        create_record(name, tasks_text, target_date)
+        await message.answer(
+            f"Запись за {target_date} сохранена!\n\n{tasks_text}",
+            reply_markup=main_kb
+        )
+    await state.clear()
+
+# ========== РЕДАКТИРОВАНИЕ ЗАПИСИ ==========
+@dp.message(lambda m: m.text == "Редактировать запись")
+async def edit_record_start(msg: types.Message, state: FSMContext):
+    name = get_user_name(msg.from_user.id)
+    if not name:
+        await msg.answer("Сначала используй /start")
+        return
+    
+    dates = get_all_user_dates(name)
+    if not dates:
+        await msg.answer("Нет записей. Сначала создай запись через «Создать запись»")
+        return
+    
+    date_kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=date)] for date in dates[:10]] + [[KeyboardButton(text="Отмена")]],
+        resize_keyboard=True
     )
-    await state.set_state(ChronoState.waiting_for_edit_line_text)
+    
+    await state.update_data(full_name=name, edit_mode=True)
+    await msg.answer("Выбери дату для редактирования:", reply_markup=date_kb)
+    await state.set_state(RecordState.choosing_date)
 
-@dp.message(ChronoState.waiting_for_edit_line_text)
-async def edit_line_text_handler(msg: types.Message, state: FSMContext):
-    new_text = msg.text.strip()
-    if len(new_text) < 3:
-        await msg.answer("Слишком коротко. Напиши нормальное описание задачи.")
+# Переопределяем обработчик выбора даты для режима редактирования
+@dp.message(RecordState.choosing_date)
+async def process_edit_date_selection(msg: types.Message, state: FSMContext):
+    if msg.text == "Отмена":
+        await msg.answer("Отменено", reply_markup=main_kb)
+        await state.clear()
         return
     
     data = await state.get_data()
-    line_num = data.get("edit_line_num")
-    accumulated = data.get("accumulated_text", "")
-    lines = [l for l in accumulated.split('\n') if l.strip()]
+    edit_mode = data.get("edit_mode", False)
     
-    lines[line_num] = new_text
-    new_accumulated = "\n".join(lines)
-    await state.update_data(accumulated_text=new_accumulated)
-    
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
+    if edit_mode:
+        target_date = msg.text
+        name = data["full_name"]
+        
+        record = get_record_by_date_and_name(name, target_date)
+        if not record:
+            await msg.answer("Запись не найдена", reply_markup=main_kb)
+            await state.clear()
+            return
+        
+        row_idx, old_text = record
+        tasks = parse_text_to_tasks(old_text)
+        
+        await state.update_data(
+            target_date=target_date,
+            tasks=tasks,
+            original_row_idx=row_idx,
+            original_text=old_text
+        )
+        
+        tasks_text = parse_tasks_to_text(tasks)
+        await msg.answer(
+            f"Редактирование записи за {target_date}\n\n"
+            f"Текущий список:\n{tasks_text}\n\n"
+            f"Выбери действие:",
+            reply_markup=create_edit_keyboard()
+        )
+        await state.set_state(RecordState.editing_task)
 
-@dp.message(ChronoState.waiting_for_delete_line_num)
-async def delete_line_num_handler(msg: types.Message, state: FSMContext):
+@dp.callback_query(RecordState.editing_task)
+async def handle_edit_actions(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if callback.data == "add_task":
+        templates = get_templates()
+        await callback.message.edit_text(
+            "Выбери задачу для добавления:",
+            reply_markup=create_templates_keyboard(templates)
+        )
+        await state.set_state(RecordState.building_task)
+        
+    elif callback.data == "edit_line":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        if not tasks:
+            await callback.message.edit_text("Нет задач для редактирования")
+            return
+        
+        # Создаем клавиатуру для выбора строки
+        keyboard = []
+        for i, task in enumerate(tasks):
+            preview = task[:30] + "..." if len(task) > 30 else task
+            keyboard.append([InlineKeyboardButton(
+                text=f"{i+1}. {preview}",
+                callback_data=f"select_edit_{i}"
+            )])
+        keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="edit_cancel")])
+        
+        await callback.message.edit_text(
+            "Выбери строку для редактирования:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+        await state.set_state(RecordState.selecting_line_to_edit)
+        
+    elif callback.data == "delete_line":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        if not tasks:
+            await callback.message.edit_text("Нет задач для удаления")
+            return
+        
+        await callback.message.edit_text(
+            "Выбери строку для удаления:",
+            reply_markup=create_line_delete_keyboard(tasks)
+        )
+        await state.set_state(RecordState.selecting_line_to_delete)
+        
+    elif callback.data == "finish_recording":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        target_date = data.get("target_date")
+        row_idx = data.get("original_row_idx")
+        
+        tasks_text = parse_tasks_to_text(tasks)
+        update_record(row_idx, tasks_text)
+        
+        await callback.message.edit_text(
+            f"Запись за {target_date} обновлена!\n\n{tasks_text}"
+        )
+        await callback.message.answer("Главное меню:", reply_markup=main_kb)
+        await state.clear()
+
+@dp.callback_query(RecordState.selecting_line_to_edit)
+async def process_line_selection_for_edit(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if callback.data == "edit_cancel":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        tasks_text = parse_tasks_to_text(tasks)
+        await callback.message.edit_text(
+            f"Редактирование записи\n\nТекущий список:\n{tasks_text}\n\nВыбери действие:",
+            reply_markup=create_edit_keyboard()
+        )
+        await state.set_state(RecordState.editing_task)
+        return
+    
+    if callback.data.startswith("select_edit_"):
+        line_index = int(callback.data.replace("select_edit_", ""))
+        await state.update_data(editing_line_index=line_index)
+        
+        await callback.message.edit_text(
+            f"Редактируем строку {line_index + 1}\n"
+            f"Отправь новый текст в формате: Дело - Часы\n\n"
+            f"Пример: Встреча - 2",
+            reply_markup=cancel_kb
+        )
+        await state.set_state(RecordState.editing_line)
+
+@dp.callback_query(RecordState.selecting_line_to_delete)
+async def process_line_selection_for_delete(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    
+    if callback.data == "delete_cancel":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        tasks_text = parse_tasks_to_text(tasks)
+        await callback.message.edit_text(
+            f"Редактирование записи\n\nТекущий список:\n{tasks_text}\n\nВыбери действие:",
+            reply_markup=create_edit_keyboard()
+        )
+        await state.set_state(RecordState.editing_task)
+        return
+    
+    if callback.data.startswith("select_delete_"):
+        line_index = int(callback.data.replace("select_delete_", ""))
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        
+        if 0 <= line_index < len(tasks):
+            deleted_task = tasks.pop(line_index)
+            await state.update_data(tasks=tasks)
+            
+            tasks_text = parse_tasks_to_text(tasks)
+            await callback.message.edit_text(
+                f"Удалено: {deleted_task}\n\n"
+                f"Текущий список:\n{tasks_text}\n\n"
+                f"Выбери действие:",
+                reply_markup=create_edit_keyboard()
+            )
+            await state.set_state(RecordState.editing_task)
+
+@dp.message(RecordState.editing_line)
+async def save_edited_line(msg: types.Message, state: FSMContext):
+    if msg.text == "Отмена":
+        data = await state.get_data()
+        tasks = data.get("tasks", [])
+        tasks_text = parse_tasks_to_text(tasks)
+        await msg.answer(
+            f"Текущий список:\n{tasks_text}\n\nВыбери действие:",
+            reply_markup=create_edit_keyboard()
+        )
+        await state.set_state(RecordState.editing_task)
+        return
+    
+    data = await state.get_data()
+    tasks = data.get("tasks", [])
+    line_index = data.get("editing_line_index")
+    
+    if " - " not in msg.text:
+        await msg.answer("Неверный формат. Используй: Дело - Часы")
+        return
+    
     try:
-        line_num = int(msg.text.strip()) - 1
-    except:
-        await msg.answer("Введи номер строки")
-        return
-    
-    data = await state.get_data()
-    accumulated = data.get("accumulated_text", "")
-    lines = [l for l in accumulated.split('\n') if l.strip()]
-    
-    if line_num < 0 or line_num >= len(lines):
-        await msg.answer(f"Строка {line_num+1} не найдена. Всего строк: {len(lines)}")
-        return
-    
-    deleted = lines.pop(line_num)
-    
-    renumbered = []
-    for i, line in enumerate(lines, 1):
-        parts = line.split('. ', 1)
-        if len(parts) > 1:
-            renumbered.append(f"{i}. {parts[1]}")
+        parts = msg.text.split(" - ")
+        activity = parts[0]
+        hours = parts[1].replace("ч", "").replace("hours", "").strip()
+        hours_value = float(hours.replace(',', '.'))
+        
+        if hours_value == int(hours_value):
+            hours_str = str(int(hours_value))
         else:
-            renumbered.append(f"{i}. {line}")
-    
-    new_accumulated = "\n".join(renumbered)
-    await state.update_data(accumulated_text=new_accumulated)
-    
-    await msg.answer(f"Удалена строка: {deleted}")
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
+            hours_str = str(hours_value)
+        
+        new_task = f"{activity} - {hours_str} ч"
+        tasks[line_index] = new_task
+        await state.update_data(tasks=tasks)
+        
+        tasks_text = parse_tasks_to_text(tasks)
+        await msg.answer(
+            f"Строка обновлена!\n\nТекущий список:\n{tasks_text}\n\nВыбери действие:",
+            reply_markup=create_edit_keyboard()
+        )
+        await state.set_state(RecordState.editing_task)
+    except Exception as e:
+        await msg.answer(f"Ошибка: неверный формат. Используй: Дело - Часы (например, Встреча - 2)")
 
-# ---------- НАПОМИНАНИЯ ----------
+# ========== НАПОМИНАНИЯ ==========
 async def reminder_loop():
     while True:
         now = datetime.now(TIMEZONE)
@@ -572,20 +668,22 @@ async def reminder_loop():
                 tg_id = int(user["telegram_id"])
                 name = user["full_name"]
                 existing = get_record_by_date_and_name(name, today_str)
+                
                 if not existing:
                     img = random.choice(GALLERY)
-                    await bot.send_photo(tg_id, img, caption=f"Напоминание {name}, внеси часы за сегодня!")
-                    await bot.send_message(tg_id, "Нажми Ввести часы", reply_markup=main_kb)
+                    await bot.send_photo(tg_id, img, caption=f"Напоминание, {name}! Внеси часы за сегодня")
+                    await bot.send_message(tg_id, "Нажми «Создать запись»", reply_markup=main_kb)
             except Exception as e:
                 print(f"Ошибка напоминания: {e}")
 
-# ---------- ЗАПУСК ----------
+# ========== ЗАПУСК ==========
 async def main():
     server_thread = threading.Thread(target=run_web_server, daemon=True)
     server_thread.start()
     
     asyncio.create_task(reminder_loop())
-    print("Бот и веб-сервер запущены")
+    
+    print("Бот и веб-сервер запущены!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
