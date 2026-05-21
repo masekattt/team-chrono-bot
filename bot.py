@@ -232,7 +232,11 @@ async def add_chrono_start(msg: types.Message, state: FSMContext):
         await msg.answer("За сегодня уже введено. Используй Изменить часы")
         return
     
-    await msg.answer("За какую дату хочешь внести часы?", reply_markup=date_choice_kb)
+    # ВАЖНО: теперь бот СПРАШИВАЕТ дату
+    await msg.answer(
+        "За какую дату хочешь внести часы?",
+        reply_markup=date_choice_kb
+    )
     await state.set_state(ChronoState.waiting_for_date)
     await state.update_data(full_name=name, is_edit=False, accumulated_text="")
 
@@ -266,35 +270,6 @@ async def process_date_choice(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(target_date=target_date)
-    await show_main_menu(msg, state)
-    await state.set_state(ChronoState.waiting_for_main)
-
-@dp.message(ChronoState.waiting_for_custom_date)
-async def process_custom_date(msg: types.Message, state: FSMContext):
-    date_str = msg.text.strip()
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    
-    try:
-        datetime.strptime(date_str, "%Y-%m-%d")
-    except:
-        await msg.answer("Неверный формат. Используй ГГГГ-ММ-ДД")
-        return
-    
-    if date_str > today:
-        await msg.answer("Нельзя вводить часы за будущие даты", reply_markup=main_kb)
-        await state.clear()
-        return
-    
-    data = await state.get_data()
-    name = data["full_name"]
-    
-    existing = get_record_by_date_and_name(name, date_str)
-    if existing:
-        await msg.answer(f"Запись за {date_str} уже существует", reply_markup=main_kb)
-        await state.clear()
-        return
-    
-    await state.update_data(target_date=date_str)
     await show_main_menu(msg, state)
     await state.set_state(ChronoState.waiting_for_main)
 
