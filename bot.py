@@ -55,6 +55,7 @@ client = gspread.authorize(creds)
 sheet = client.open_by_key(SHEET_ID)
 users_ws = sheet.worksheet("Users")
 chrono_ws = sheet.worksheet("Chrono")
+templates_ws = sheet.worksheet("Templates")
 
 # ========== КНОПКИ ==========
 main_kb = ReplyKeyboardMarkup(
@@ -90,18 +91,15 @@ def get_add_method_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Шаблон")],
-            [KeyboardButton(text="Свой текст")],
+            [KeyboardButton(text="Другие активности")],
             [KeyboardButton(text="Назад к списку")]
         ],
         resize_keyboard=True
     )
 
 # ========== ШАБЛОНЫ ==========
-TEMPLATES_SHEET_NAME = "Templates"
-
 def load_templates_from_sheet():
     try:
-        templates_ws = sheet.worksheet(TEMPLATES_SHEET_NAME)
         records = templates_ws.get_all_records()
         templates = []
         for row in records:
@@ -126,7 +124,7 @@ def get_template_keyboard():
             row = []
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
-# ========== FSM СОСТОЯНИЯ ==========
+# ========== FSM ==========
 class RegisterState(StatesGroup):
     waiting_for_name = State()
 
@@ -178,8 +176,7 @@ def update_record(row_idx, new_text):
 def add_line_to_list(accumulated, task_name, hours_str):
     lines = accumulated.strip().split('\n') if accumulated else []
     next_num = len([l for l in lines if l.strip()]) + 1
-    new_line = f"{next_num}. {task_name} - {hours_str} часа"
-    return new_line
+    return f"{next_num}. {task_name} - {hours_str} часа"
 
 async def show_main_menu(msg: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -208,7 +205,7 @@ async def cmd_start(msg: types.Message, state: FSMContext):
     if name:
         await msg.answer(f"С возвращением, {name}!", reply_markup=main_kb)
     else:
-        await msg.answer("Привет! Как тебя зовут?")
+        await msg.answer("Привет! Как тебя зовут? (напиши ФИО)")
         await state.set_state(RegisterState.waiting_for_name)
 
 @dp.message(RegisterState.waiting_for_name)
@@ -235,7 +232,7 @@ async def add_chrono_start(msg: types.Message, state: FSMContext):
         await msg.answer("За сегодня уже введено. Используй Изменить часы")
         return
     
-    await msg.answer("Выбери дату:", reply_markup=date_choice_kb)
+    await msg.answer("За какую дату хочешь внести часы?", reply_markup=date_choice_kb)
     await state.set_state(ChronoState.waiting_for_date)
     await state.update_data(full_name=name, is_edit=False, accumulated_text="")
 
@@ -253,13 +250,13 @@ async def process_date_choice(msg: types.Message, state: FSMContext):
         target_date = yesterday
     elif choice == "Другая дата":
         await msg.answer(
-            "Введи дату в формате ГГГГ-ММ-ДД:",
+            "Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
             reply_markup=types.ReplyKeyboardRemove()
         )
         await state.set_state(ChronoState.waiting_for_custom_date)
         return
     else:
-        await msg.answer("Используй кнопки")
+        await msg.answer("Используй кнопки для выбора даты")
         return
     
     existing = get_record_by_date_and_name(name, target_date)
@@ -310,7 +307,7 @@ async def edit_chrono_start(msg: types.Message, state: FSMContext):
         return
     
     await msg.answer(
-        "Введи дату в формате ГГГГ-ММ-ДД:",
+        "Введи дату в формате ГГГГ-ММ-ДД (например 2026-05-21):",
         reply_markup=types.ReplyKeyboardRemove()
     )
     await state.set_state(ChronoState.waiting_for_edit_date)
@@ -376,7 +373,7 @@ async def main_list_handler(msg: types.Message, state: FSMContext):
     
     if msg.text == "Добавить задачу":
         await msg.answer(
-            "Выбери способ:",
+            "Выбери способ добавления:",
             reply_markup=get_add_method_keyboard()
         )
         await state.set_state(ChronoState.waiting_for_add_method)
@@ -431,11 +428,12 @@ async def add_method_handler(msg: types.Message, state: FSMContext):
         await state.set_state(ChronoState.waiting_for_template_hours)
         return
     
-    if msg.text == "Свой текст":
+    if msg.text == "Другие активности":
         await msg.answer(
-            "Напиши задачу в формате: Название - часы\n"
-            "Пример: Документация - 1.5\n\n"
-            "Можно написать несколько задач, каждую с новой строки.",
+            "Расскажи, что выходящего за рамки ты сегодня сделал.\n\n"
+            "Формат: Название задачи - часы\n"
+            "Пример: Документация - 1,5 часа\n\n"
+            "Ты можешь написать сразу несколько задач, каждую с новой строки.",
             reply_markup=types.ReplyKeyboardRemove()
         )
         await state.set_state(ChronoState.waiting_for_custom_text)
@@ -447,11 +445,9 @@ async def template_choice_handler(msg: types.Message, state: FSMContext):
     
     if msg.text in templates:
         await state.update_data(current_template=msg.text)
-        await msg.answer(f"Введи часы для: {msg.text}")
-        # Остаёмся в том же состоянии, но теперь ждём число
+        await msg.answer(f"Введи количество часов для: {msg.text}")
         return
     
-    # Если это число (часы) для предыдущего шаблона
     try:
         hours_clean = msg.text.replace(',', '.')
         hours_float = float(hours_clean)
@@ -461,14 +457,12 @@ async def template_choice_handler(msg: types.Message, state: FSMContext):
         await msg.answer("Выбери шаблон или введи число часов", reply_markup=get_template_keyboard())
         return
     
-    # Получаем сохранённый шаблон
     data = await state.get_data()
     template = data.get("current_template")
     if not template:
         await msg.answer("Сначала выбери шаблон", reply_markup=get_template_keyboard())
         return
     
-    # Добавляем строку
     accumulated = data.get("accumulated_text", "")
     hours_str = str(hours_float).replace('.', ',')
     new_line = add_line_to_list(accumulated, template, hours_str)
@@ -486,13 +480,12 @@ async def template_choice_handler(msg: types.Message, state: FSMContext):
 async def custom_text_handler(msg: types.Message, state: FSMContext):
     text = msg.text.strip()
     if len(text) < 5:
-        await msg.answer("Слишком коротко")
+        await msg.answer("Слишком коротко. Напиши хотя бы одну задачу.")
         return
     
     data = await state.get_data()
     accumulated = data.get("accumulated_text", "")
     
-    # Разбиваем на строки
     lines = accumulated.strip().split('\n') if accumulated else []
     next_num = len([l for l in lines if l.strip()]) + 1
     
@@ -531,7 +524,7 @@ async def edit_line_num_handler(msg: types.Message, state: FSMContext):
     
     await state.update_data(edit_line_num=line_num)
     await msg.answer(
-        f"Текущая строка:\n{lines[line_num]}\n\nВведи новый текст:"
+        f"Текущая строка:\n{lines[line_num]}\n\nВведи новый текст для этой строки:"
     )
     await state.set_state(ChronoState.waiting_for_edit_line_text)
 
@@ -539,7 +532,7 @@ async def edit_line_num_handler(msg: types.Message, state: FSMContext):
 async def edit_line_text_handler(msg: types.Message, state: FSMContext):
     new_text = msg.text.strip()
     if len(new_text) < 3:
-        await msg.answer("Слишком коротко")
+        await msg.answer("Слишком коротко. Напиши нормальное описание задачи.")
         return
     
     data = await state.get_data()
@@ -572,7 +565,6 @@ async def delete_line_num_handler(msg: types.Message, state: FSMContext):
     
     deleted = lines.pop(line_num)
     
-    # Перенумеровываем
     renumbered = []
     for i, line in enumerate(lines, 1):
         parts = line.split('. ', 1)
@@ -584,7 +576,7 @@ async def delete_line_num_handler(msg: types.Message, state: FSMContext):
     new_accumulated = "\n".join(renumbered)
     await state.update_data(accumulated_text=new_accumulated)
     
-    await msg.answer(f"Удалено: {deleted}")
+    await msg.answer(f"Удалена строка: {deleted}")
     await show_main_menu(msg, state)
     await state.set_state(ChronoState.waiting_for_main)
 
