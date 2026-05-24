@@ -72,7 +72,9 @@ dp.include_router(router)
 # Глобальные переменные
 spreadsheet = None
 templates_cache = []
+ADMIN_IDS = []
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+last_templates_update = None
 
 # Состояния FSM
 class RegistrationStates(StatesGroup):
@@ -99,18 +101,43 @@ class EditStates(StatesGroup):
     waiting_for_edit_new_text = State()
     waiting_for_delete_line_number = State()
 
+class AdminStates(StatesGroup):
+    main_menu = State()
+    add_template = State()
+    edit_template_select = State()
+    edit_template_new_text = State()
+    delete_template = State()
+
 # Вспомогательные функции
 def load_templates():
     """Загрузка шаблонов из Google Sheets"""
-    global templates_cache
+    global templates_cache, last_templates_update
     try:
         templates_sheet = spreadsheet.worksheet('Templates')
         templates = templates_sheet.col_values(1)[1:]  # Пропускаем заголовок
-        templates_cache = [t for t in templates if t.strip()]
-        logger.info(f"Загружено {len(templates_cache)} шаблонов")
+        new_templates = [t for t in templates if t.strip()]
+        
+        if new_templates != templates_cache:
+            templates_cache = new_templates
+            last_templates_update = datetime.now(MOSCOW_TZ)
+            logger.info(f"Загружено {len(templates_cache)} шаблонов")
+            return True
+        return False
     except Exception as e:
         logger.error(f"Ошибка загрузки шаблонов: {e}")
-        templates_cache = []
+        return False
+
+def load_admins():
+    """Загрузка списка администраторов из Google Sheets"""
+    global ADMIN_IDS
+    try:
+        admins_sheet = spreadsheet.worksheet('Admins')
+        admins = admins_sheet.get_all_records()
+        ADMIN_IDS = [admin['telegram_id'] for admin in admins if admin['telegram_id']]
+        logger.info(f"Загружено {len(ADMIN_IDS)} администраторов: {ADMIN_IDS}")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки администраторов: {e}")
+        ADMIN_IDS = []
 
 def get_user_name(telegram_id: int) -> Optional[str]:
     """Получение имени пользователя по telegram_id"""
@@ -238,13 +265,18 @@ def delete_task_from_list(tasks: List[str], line_number: int) -> List[str]:
         tasks.pop(line_number)
     return tasks
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    """Главное меню"""
+def get_main_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
+    """Главное меню (с админ-кнопкой для администраторов)"""
+    keyboard = [
+        [KeyboardButton(text="Ввести часы")],
+        [KeyboardButton(text="Изменить часы")],
+    ]
+    
+    if user_id and user_id in ADMIN_IDS:
+        keyboard.append([KeyboardButton(text="Админ-панель")])
+    
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Ввести часы")],
-            [KeyboardButton(text="Изменить часы")]
-        ],
+        keyboard=keyboard,
         resize_keyboard=True
     )
 
@@ -293,6 +325,19 @@ def get_templates_keyboard() -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_template")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_admin_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура админ-панели"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Показать шаблоны")],
+            [KeyboardButton(text="Добавить шаблон"), KeyboardButton(text="Удалить шаблон")],
+            [KeyboardButton(text="Редактировать шаблон")],
+            [KeyboardButton(text="Обновить из таблицы")],
+            [KeyboardButton(text="Выйти из админ-панели")]
+        ],
+        resize_keyboard=True
+    )
+
 def validate_date(date_text: str) -> bool:
     """Проверка корректности даты"""
     try:
@@ -311,10 +356,47 @@ def validate_hours(hours_text: str) -> bool:
     except ValueError:
         return False
 
+async def show_task_list(message: Message, state: FSMContext, tasks: List[str]):
+    """Показать список задач и меню управления"""
+    formatted_tasks = format_tasks_list(tasks)
+    
+    await message.answer(
+        f"Текущий список:\n{formatted_tasks}\n\nВыбери действие:",
+        reply_markup=get_task_management_keyboard()
+    )
+    await state.set_state(TimeEntryStates.managing_tasks)
+
+async def show_edit_task_list(message: Message, state: FSMContext, tasks: List[str]):
+    """Показать список задач при редактировании"""
+    formatted_tasks = format_tasks_list(tasks)
+    
+    await message.answer(
+        f"Текущий список:\n{formatted_tasks}\n\nВыбери действие:",
+        reply_markup=get_task_management_keyboard()
+    )
+    await state.set_state(EditStates.managing_tasks)
+
+async def back_to_admin_menu(message: Message, state: FSMContext):
+    """Возврат в админ-меню"""
+    await message.answer(
+        "Админ-панель",
+        reply_markup=get_admin_keyboard()
+    )
+    await state.set_state(AdminStates.main_menu)
+
+async def back_to_main_menu(message: Message, state: FSMContext):
+    """Возврат в главное меню"""
+    await message.answer(
+        "Главное меню",
+        reply_markup=get_main_keyboard(message.from_user.id)
+    )
+    await state.clear()
+
 # Обработчики команд
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     """Обработчик команды /start"""
+    await state.clear()
     telegram_id = message.from_user.id
     
     # Проверяем, зарегистрирован ли пользователь
@@ -323,7 +405,7 @@ async def cmd_start(message: Message, state: FSMContext):
     if user_name:
         await message.answer(
             f"С возвращением, {user_name}!",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(telegram_id)
         )
     else:
         await message.answer(
@@ -331,6 +413,41 @@ async def cmd_start(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove()
         )
         await state.set_state(RegistrationStates.waiting_for_name)
+
+@router.message(Command("refresh"))
+async def cmd_refresh(message: Message, state: FSMContext):
+    """Обновление шаблонов из Google Sheets"""
+    await state.clear()
+    
+    load_admins()  # Обновляем также список администраторов
+    
+    if load_templates():
+        await message.answer(
+            f"Шаблоны обновлены! Загружено {len(templates_cache)} шаблонов.",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+    else:
+        await message.answer(
+            f"Шаблоны не изменились. Текущее количество: {len(templates_cache)}",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+
+@router.message(Command("templates"))
+async def cmd_templates(message: Message, state: FSMContext):
+    """Показать текущие шаблоны"""
+    await state.clear()
+    
+    if templates_cache:
+        await message.answer(
+            f"Текущие шаблоны ({len(templates_cache)}):\n" + 
+            "\n".join([f"{i+1}. {t}" for i, t in enumerate(templates_cache)]),
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+    else:
+        await message.answer(
+            "Шаблоны не загружены. Используйте /refresh для загрузки.",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
 
 @router.message(RegistrationStates.waiting_for_name)
 async def process_name(message: Message, state: FSMContext):
@@ -347,7 +464,7 @@ async def process_name(message: Message, state: FSMContext):
         register_user(telegram_id, full_name)
         await message.answer(
             f"Принято, {full_name}!",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(telegram_id)
         )
         await state.clear()
     except Exception as e:
@@ -358,6 +475,7 @@ async def process_name(message: Message, state: FSMContext):
 @router.message(F.text == "Ввести часы")
 async def start_enter_time(message: Message, state: FSMContext):
     """Начало ввода часов"""
+    await state.clear()
     await message.answer(
         "За какую дату хочешь внести часы?",
         reply_markup=get_date_choice_keyboard()
@@ -368,8 +486,7 @@ async def start_enter_time(message: Message, state: FSMContext):
 async def process_date_choice(message: Message, state: FSMContext):
     """Обработка выбора даты"""
     if message.text == "Отмена":
-        await message.answer("Операция отменена.", reply_markup=get_main_keyboard())
-        await state.clear()
+        await back_to_main_menu(message, state)
         return
     
     today = datetime.now(MOSCOW_TZ).date()
@@ -391,7 +508,7 @@ async def process_date_choice(message: Message, state: FSMContext):
     if check_existing_entry(telegram_id, selected_date):
         await message.answer(
             f"Запись за {selected_date} уже существует. Используй 'Изменить часы'",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(telegram_id)
         )
         await state.clear()
         return
@@ -399,16 +516,6 @@ async def process_date_choice(message: Message, state: FSMContext):
     # Создаем новую запись
     await state.update_data(selected_date=selected_date, tasks=[])
     await show_task_list(message, state, [])
-
-async def show_task_list(message: Message, state: FSMContext, tasks: List[str]):
-    """Показать список задач и меню управления"""
-    formatted_tasks = format_tasks_list(tasks)
-    
-    await message.answer(
-        f"Текущий список:\n{formatted_tasks}\n\nВыбери действие:",
-        reply_markup=get_task_management_keyboard()
-    )
-    await state.set_state(TimeEntryStates.managing_tasks)
 
 @router.message(TimeEntryStates.waiting_for_custom_date)
 async def process_custom_date(message: Message, state: FSMContext):
@@ -423,7 +530,7 @@ async def process_custom_date(message: Message, state: FSMContext):
     if check_existing_entry(telegram_id, date_text):
         await message.answer(
             f"Запись за {date_text} уже существует. Используй 'Изменить часы'",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(telegram_id)
         )
         await state.clear()
         return
@@ -639,7 +746,7 @@ async def finish_entry(message: Message, state: FSMContext):
         save_new_entry(message.from_user.id, selected_date, text_to_save)
         await message.answer(
             f"Запись за {selected_date} сохранена!",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.clear()
     except Exception as e:
@@ -649,13 +756,13 @@ async def finish_entry(message: Message, state: FSMContext):
 @router.message(TimeEntryStates.managing_tasks, F.text == "Отмена")
 async def cancel_entry(message: Message, state: FSMContext):
     """Отмена ввода"""
-    await message.answer("Операция отменена.", reply_markup=get_main_keyboard())
-    await state.clear()
+    await back_to_main_menu(message, state)
 
 # Обработчики для "Изменить часы"
 @router.message(F.text == "Изменить часы")
 async def start_edit_time(message: Message, state: FSMContext):
     """Начало изменения часов"""
+    await state.clear()
     await message.answer(
         "Введи дату записи, которую хочешь изменить (ГГГГ-ММ-ДД):",
         reply_markup=ReplyKeyboardRemove()
@@ -677,7 +784,7 @@ async def process_edit_date(message: Message, state: FSMContext):
     if not entry:
         await message.answer(
             f"Запись за {date_text} не найдена.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(telegram_id)
         )
         await state.clear()
         return
@@ -748,16 +855,6 @@ async def edit_cancel_template_choice(callback_query, state: FSMContext):
     
     await callback_query.message.edit_text("Выбор шаблона отменён")
     await show_edit_task_list(callback_query.message, state, tasks)
-
-async def show_edit_task_list(message: Message, state: FSMContext, tasks: List[str]):
-    """Показать список задач при редактировании"""
-    formatted_tasks = format_tasks_list(tasks)
-    
-    await message.answer(
-        f"Текущий список:\n{formatted_tasks}\n\nВыбери действие:",
-        reply_markup=get_task_management_keyboard()
-    )
-    await state.set_state(EditStates.managing_tasks)
 
 @router.message(EditStates.waiting_for_hours)
 async def edit_process_hours_input(message: Message, state: FSMContext):
@@ -917,7 +1014,7 @@ async def edit_finish_entry(message: Message, state: FSMContext):
         update_entry(entry_row, text_to_save)
         await message.answer(
             "Запись обновлена!",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(message.from_user.id)
         )
         await state.clear()
     except Exception as e:
@@ -927,14 +1024,255 @@ async def edit_finish_entry(message: Message, state: FSMContext):
 @router.message(EditStates.managing_tasks, F.text == "Отмена")
 async def edit_cancel_entry(message: Message, state: FSMContext):
     """Отмена редактирования"""
-    await message.answer("Операция отменена.", reply_markup=get_main_keyboard())
+    await back_to_main_menu(message, state)
+
+# Админ-панель
+@router.message(F.text == "Админ-панель")
+async def admin_panel(message: Message, state: FSMContext):
+    """Вход в админ-панель"""
     await state.clear()
+    
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("У вас нет доступа к админ-панели.")
+        return
+    
+    # Обновляем шаблоны и админов при входе
+    load_templates()
+    load_admins()
+    
+    await message.answer(
+        "Админ-панель управления шаблонами\n"
+        f"Текущие шаблоны ({len(templates_cache)}):\n" + 
+        ("\n".join([f"{i+1}. {t}" for i, t in enumerate(templates_cache)]) if templates_cache else "Нет шаблонов"),
+        reply_markup=get_admin_keyboard()
+    )
+    await state.set_state(AdminStates.main_menu)
+
+@router.message(AdminStates.main_menu, F.text == "Показать шаблоны")
+async def admin_show_templates(message: Message, state: FSMContext):
+    """Показать все шаблоны"""
+    if templates_cache:
+        await message.answer(
+            f"Текущие шаблоны ({len(templates_cache)}):\n" + 
+            "\n".join([f"{i+1}. {t}" for i, t in enumerate(templates_cache)])
+        )
+    else:
+        await message.answer("Список шаблонов пуст.")
+
+@router.message(AdminStates.main_menu, F.text == "Добавить шаблон")
+async def admin_add_template(message: Message, state: FSMContext):
+    """Добавление нового шаблона"""
+    await message.answer(
+        "Введи название нового шаблона:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(AdminStates.add_template)
+
+@router.message(AdminStates.add_template)
+async def process_add_template(message: Message, state: FSMContext):
+    """Обработка добавления шаблона"""
+    if message.text == "Отмена":
+        await back_to_admin_menu(message, state)
+        return
+    
+    new_template = message.text.strip()
+    
+    if not new_template:
+        await message.answer("Название шаблона не может быть пустым.")
+        return
+    
+    if new_template in templates_cache:
+        await message.answer("Такой шаблон уже существует.")
+        return
+    
+    try:
+        # Добавляем в Google Sheets
+        templates_sheet = spreadsheet.worksheet('Templates')
+        templates_sheet.append_row([new_template])
+        
+        # Обновляем локальный кэш
+        load_templates()
+        
+        await message.answer(
+            f"Шаблон '{new_template}' добавлен!",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(AdminStates.main_menu)
+    except Exception as e:
+        await message.answer(f"Ошибка при добавлении шаблона: {e}")
+        logger.error(f"Ошибка добавления шаблона: {e}")
+
+@router.message(AdminStates.main_menu, F.text == "Удалить шаблон")
+async def admin_delete_template(message: Message, state: FSMContext):
+    """Удаление шаблона"""
+    if not templates_cache:
+        await message.answer("Нет шаблонов для удаления.")
+        return
+    
+    # Создаем inline клавиатуру с шаблонами для удаления
+    buttons = []
+    for i, template in enumerate(templates_cache):
+        buttons.append([InlineKeyboardButton(
+            text=f"❌ {template}", 
+            callback_data=f"delete_template_{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_delete")])
+    
+    await message.answer(
+        "Выбери шаблон для удаления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@router.callback_query(F.data.startswith("delete_template_"))
+async def process_delete_template(callback_query, state: FSMContext):
+    """Обработка удаления шаблона"""
+    template_index = int(callback_query.data.split("_")[2])
+    
+    if 0 <= template_index < len(templates_cache):
+        template_name = templates_cache[template_index]
+        
+        try:
+            # Удаляем из Google Sheets (находим строку и удаляем)
+            templates_sheet = spreadsheet.worksheet('Templates')
+            all_templates = templates_sheet.col_values(1)
+            
+            for i, t in enumerate(all_templates):
+                if t == template_name:
+                    templates_sheet.delete_rows(i + 1)  # +1 из-за 1-based индексации
+                    break
+            
+            # Обновляем локальный кэш
+            load_templates()
+            
+            await callback_query.message.edit_text(f"Шаблон '{template_name}' удален!")
+            await callback_query.message.answer(
+                f"Шаблон '{template_name}' успешно удален.",
+                reply_markup=get_admin_keyboard()
+            )
+        except Exception as e:
+            await callback_query.answer(f"Ошибка при удалении: {e}")
+            logger.error(f"Ошибка удаления шаблона: {e}")
+    else:
+        await callback_query.answer("Шаблон не найден")
+
+@router.callback_query(F.data == "cancel_delete")
+async def cancel_delete_template(callback_query, state: FSMContext):
+    """Отмена удаления шаблона"""
+    await callback_query.message.edit_text("Удаление отменено.")
+    await state.set_state(AdminStates.main_menu)
+
+@router.message(AdminStates.main_menu, F.text == "Редактировать шаблон")
+async def admin_edit_template(message: Message, state: FSMContext):
+    """Редактирование шаблона"""
+    if not templates_cache:
+        await message.answer("Нет шаблонов для редактирования.")
+        return
+    
+    # Создаем inline клавиатуру с шаблонами для редактирования
+    buttons = []
+    for i, template in enumerate(templates_cache):
+        buttons.append([InlineKeyboardButton(
+            text=f"✏️ {template}", 
+            callback_data=f"edit_template_{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel_edit")])
+    
+    await message.answer(
+        "Выбери шаблон для редактирования:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await state.set_state(AdminStates.edit_template_select)
+
+@router.callback_query(AdminStates.edit_template_select, F.data.startswith("edit_template_"))
+async def select_template_to_edit(callback_query, state: FSMContext):
+    """Выбор шаблона для редактирования"""
+    template_index = int(callback_query.data.split("_")[2])
+    
+    if 0 <= template_index < len(templates_cache):
+        template_name = templates_cache[template_index]
+        await state.update_data(edit_template_index=template_index, edit_template_old=template_name)
+        
+        await callback_query.message.edit_text(
+            f"Редактирование шаблона: {template_name}\nВведи новое название:"
+        )
+        await state.set_state(AdminStates.edit_template_new_text)
+    else:
+        await callback_query.answer("Шаблон не найден")
+
+@router.callback_query(AdminStates.edit_template_select, F.data == "cancel_edit")
+async def cancel_edit_template(callback_query, state: FSMContext):
+    """Отмена редактирования шаблона"""
+    await callback_query.message.edit_text("Редактирование отменено.")
+    await state.set_state(AdminStates.main_menu)
+
+@router.message(AdminStates.edit_template_new_text)
+async def process_edit_template(message: Message, state: FSMContext):
+    """Обработка редактирования шаблона"""
+    new_name = message.text.strip()
+    
+    if not new_name:
+        await message.answer("Название шаблона не может быть пустым.")
+        return
+    
+    data = await state.get_data()
+    old_name = data.get('edit_template_old')
+    
+    try:
+        # Обновляем в Google Sheets
+        templates_sheet = spreadsheet.worksheet('Templates')
+        all_templates = templates_sheet.col_values(1)
+        
+        for i, t in enumerate(all_templates):
+            if t == old_name:
+                templates_sheet.update(f'A{i + 1}', [[new_name]])
+                break
+        
+        # Обновляем локальный кэш
+        load_templates()
+        
+        await message.answer(
+            f"Шаблон '{old_name}' изменен на '{new_name}'!",
+            reply_markup=get_admin_keyboard()
+        )
+        await state.set_state(AdminStates.main_menu)
+    except Exception as e:
+        await message.answer(f"Ошибка при редактировании шаблона: {e}")
+        logger.error(f"Ошибка редактирования шаблона: {e}")
+
+@router.message(AdminStates.main_menu, F.text == "Обновить из таблицы")
+async def admin_refresh_templates(message: Message, state: FSMContext):
+    """Принудительное обновление шаблонов из таблицы"""
+    load_admins()  # Обновляем также список администраторов
+    
+    if load_templates():
+        await message.answer(
+            f"Шаблоны обновлены! Загружено {len(templates_cache)} шаблонов:\n" + 
+            "\n".join([f"{i+1}. {t}" for i, t in enumerate(templates_cache)])
+        )
+    else:
+        await message.answer(
+            "Шаблоны актуальны. Изменений не обнаружено."
+        )
+
+@router.message(AdminStates.main_menu, F.text == "Выйти из админ-панели")
+async def exit_admin_panel(message: Message, state: FSMContext):
+    """Выход из админ-панели"""
+    await back_to_main_menu(message, state)
 
 # Функция отправки напоминаний
 async def send_reminders():
     """Отправка напоминаний пользователям без записей за сегодня"""
     try:
         current_time = datetime.now(MOSCOW_TZ)
+        
+        # Автоматическое обновление шаблонов и админов каждые 30 минут
+        if last_templates_update is None or \
+           (current_time - last_templates_update).total_seconds() > 1800:
+            load_templates()
+            load_admins()
         
         # Проверяем, что сейчас 19:00
         if current_time.hour == 19 and current_time.minute == 0:
@@ -963,7 +1301,7 @@ async def send_reminders():
                         await bot.send_message(
                             chat_id=user['telegram_id'],
                             text=f"Напоминание {user['full_name']}, внеси часы за сегодня!\n\nНажми 'Ввести часы'",
-                            reply_markup=get_main_keyboard()
+                            reply_markup=get_main_keyboard(user['telegram_id'])
                         )
                         logger.info(f"Отправлено напоминание пользователю {user['full_name']}")
                         await asyncio.sleep(1)  # Небольшая задержка между сообщениями
@@ -977,9 +1315,13 @@ async def main():
     """Главная функция запуска бота"""
     global spreadsheet
     
+    # Удаляем вебхук и закрываем старые сессии
+    await bot.delete_webhook(drop_pending_updates=True)
+    
     # Инициализация Google Sheets
     spreadsheet = init_google_sheets()
     load_templates()
+    load_admins()
     
     # Запуск Flask в отдельном потоке
     flask_thread = Thread(target=run_flask)
